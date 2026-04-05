@@ -15,13 +15,13 @@
  {:dev
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-dsl {:local/root "../hive-dsl"}
-    io.github.hive-agi/hive-test {:local/root "../hive-test"}
+   {io.github.hive-agi/hive-dsl {:git/tag "v0.3.8" :git/sha "6f44e1b"}
+    io.github.hive-agi/hive-test {:git/tag "v0.1.5" :git/sha "db72654"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
 
   :test
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-test {:local/root "../hive-test"}
+   {io.github.hive-agi/hive-test {:git/tag "v0.1.5" :git/sha "db72654"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}
    :main-opts ["-m" "kaocha.runner"]}}}
