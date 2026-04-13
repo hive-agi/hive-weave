@@ -8,6 +8,7 @@
      hive-weave.safe      — safe deref, safe future (never hangs)
      hive-weave.gate      — semaphore-bounded execution
      hive-weave.parallel  — bounded-pmap, fork-join, fan-out
+     hive-weave.pool      — bounded ThreadPoolExecutor + safe await!
      hive-weave.timed     — timed interceptors, timed handlers
 
    Quick start:
@@ -36,6 +37,7 @@
   (:require [hive-weave.safe :as safe]
             [hive-weave.gate :as gate]
             [hive-weave.parallel :as par]
+            [hive-weave.pool :as pool]
             [hive-weave.timed :as timed]))
 
 ;;; --- Safe Deref & Future ---
@@ -57,6 +59,15 @@
 (def bounded-pmap par/bounded-pmap)
 (def fork-join par/fork-join)
 (def fan-out par/fan-out)
+
+;;; --- Pool ---
+(def make-pool pool/make-pool)
+(def pool-submit! pool/submit!)
+(def pool-await! pool/await!)
+(def pool-stats pool/pool-stats)
+(def pool-shutdown! pool/shutdown!)
+(defmacro with-pool-await [pool opts & body]
+  `(pool/with-pool-await ~pool ~opts ~@body))
 
 ;;; --- Timed ---
 (def wrap-timed timed/wrap-timed)
