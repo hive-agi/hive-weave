@@ -86,6 +86,83 @@
    (ThreadPoolExecutor$CallerRunsPolicy.)))
 
 ;; =============================================================================
+;; Binding Conveyor (DIP) — make dynvar conveyance swappable across thread boundaries
+;; =============================================================================
+;;
+;; All async boundaries (futures, go-blocks, pool tasks) lose dynamic var
+;; bindings unless the work-fn is wrapped with `clojure.core/bound-fn*`.
+;; Routing every async submission through a single conveyor makes that
+;; behaviour swappable: tests can install a `CapturingConveyor` to inspect
+;; what frame leaked, or a `NoopConveyor` to assert the leak repros.
+
+(defprotocol IBindingConveyor
+  (convey [this f] "Wrap thunk f so dynamic-var bindings transfer to the executing thread."))
+
+(defrecord BoundFnConveyor []
+  IBindingConveyor
+  (convey [_ f] (clojure.core/bound-fn* f)))
+
+(defrecord NoopConveyor []
+  IBindingConveyor
+  (convey [_ f] f))
+
+(defrecord CapturingConveyor [captured]
+  IBindingConveyor
+  (convey [_ f]
+    (reset! captured (get-thread-bindings))
+    (clojure.core/bound-fn* f)))
+
+(defrecord FixedFrameConveyor [^Object frame]
+  IBindingConveyor
+  (convey [_ f]
+    ;; Install a captured thread-binding frame on the executing thread —
+    ;; needed when the work-fn runs inside a long-lived go-loop / executor
+    ;; whose own frame was captured at module load (root bindings) but
+    ;; tests set bindings later. Snapshot frame at fixture start via
+    ;; `(clojure.lang.Var/cloneThreadBindingFrame)`.
+    (fn []
+      (let [prior (clojure.lang.Var/cloneThreadBindingFrame)]
+        (try
+          (clojure.lang.Var/resetThreadBindingFrame frame)
+          (f)
+          (finally
+            (clojure.lang.Var/resetThreadBindingFrame prior)))))))
+
+(defn capture-frame
+  "Snapshot the current thread's binding frame. Pair with FixedFrameConveyor
+   to inject this frame into work-fns running on other threads."
+  []
+  (clojure.lang.Var/cloneThreadBindingFrame))
+
+(defonce ^:private active-conveyor (atom (->BoundFnConveyor)))
+
+(defn set-conveyor!
+  "Install conveyor c as the active binding conveyor. Returns prior conveyor."
+  [c]
+  {:pre [(satisfies? IBindingConveyor c)]}
+  (let [prior @active-conveyor]
+    (reset! active-conveyor c)
+    prior))
+
+(defn get-conveyor
+  "Return active conveyor. Falls back to BoundFnConveyor if atom is nil."
+  []
+  (or @active-conveyor (->BoundFnConveyor)))
+
+(defn convey-fn
+  "Wrap thunk f via the active conveyor — the canonical entry point for
+   any async submission that must preserve dynamic-var bindings."
+  [f]
+  (convey (get-conveyor) f))
+
+(defmacro bound-future
+  "Drop-in replacement for `clojure.core/future` that conveys the caller's
+   dynamic-var bindings through the active IBindingConveyor."
+  [& body]
+  `(let [f# (convey-fn (fn [] ~@body))]
+     (future-call f#)))
+
+;; =============================================================================
 ;; Submit / Await
 ;; =============================================================================
 
@@ -104,17 +181,17 @@
 (defn submit!
   "Submit `f` to `pool`, returning a java.util.concurrent.Future.
 
-   `f` is wrapped with `clojure.core/bound-fn*` so the caller's
-   dynamic var frame (any `^:dynamic` vars currently bound on the
-   submitting thread) is conveyed to the pool thread. This matches
-   the behaviour of `clojure.core/future` and avoids a silent trap
-   where code relying on `binding` loses its frame at the pool
+   `f` is wrapped via the active `IBindingConveyor` (default
+   `BoundFnConveyor`, equivalent to `clojure.core/bound-fn*`) so the
+   caller's dynamic var frame is conveyed to the pool thread. This
+   matches the behaviour of `clojure.core/future` and avoids a silent
+   trap where code relying on `binding` loses its frame at the pool
    boundary.
 
    On RejectedExecutionException (pool shut down), runs `f` on the
    caller thread and returns a synthetic already-completed Future."
   ^Future [^ThreadPoolExecutor pool ^Callable f]
-  (let [bf (bound-fn* f)]
+  (let [bf (convey-fn f)]
     (try
       (.submit pool ^Callable bf)
       (catch RejectedExecutionException _

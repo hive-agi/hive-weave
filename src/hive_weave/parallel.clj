@@ -38,16 +38,14 @@
           process (fn [item]
                     (if (.tryAcquire sem timeout-ms TimeUnit/MILLISECONDS)
                       (try
-                        (let [fut (future (f item))
-                              result (deref fut timeout-ms ::timed-out)]
-                          (if (= result ::timed-out)
-                            (do (future-cancel fut)
-                                (log/debug "bounded-pmap: item timed out after" timeout-ms "ms")
-                                fallback)
-                            result))
-                        (catch Exception e
-                          (log/debug "bounded-pmap: item failed:" (ex-message e))
-                          fallback)
+                        (r/rescue-log "bounded-pmap" fallback
+                          (let [fut (future (f item))
+                                result (deref fut timeout-ms ::timed-out)]
+                            (if (= result ::timed-out)
+                              (do (future-cancel fut)
+                                  (log/debug "bounded-pmap: item timed out after" timeout-ms "ms")
+                                  fallback)
+                              result)))
                         (finally
                           (.release sem)))
                       (do (log/debug "bounded-pmap: semaphore acquire timed out")
@@ -79,10 +77,8 @@
                                                         task
                                                         [(first task) (second task) nil])]
                                [k {:future (future
-                                             (try (thunk)
-                                                  (catch Exception e
-                                                    (log/debug "fork-join" k "failed:" (ex-message e))
-                                                    {::failed e})))
+                                             (r/rescue-log (str "fork-join " k) {::failed true}
+                                               (thunk)))
                                    :fallback fallback}])))
                       tasks)
         deadline (+ (System/currentTimeMillis) budget-ms)]

@@ -58,8 +58,8 @@
   (let [fut (future
               (try
                 (f)
-                (catch Exception e
-                  {::exception e})))
+                (catch Throwable t
+                  {::exception t})))
         result (deref fut timeout-ms ::timed-out)]
     (cond
       (= result ::timed-out)
@@ -70,7 +70,7 @@
       (and (map? result) (::exception result))
       (let [ex (::exception result)]
         (r/err :weave/exception {:name name
-                                 :message (.getMessage ^Exception ex)
+                                 :message (.getMessage ^Throwable ex)
                                  :class (str (class ex))}))
 
       :else

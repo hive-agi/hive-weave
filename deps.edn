@@ -6,7 +6,7 @@
 
   ;; Result types, rescue/guard, lifecycle protocol
   io.github.hive-agi/hive-dsl
-  {:git/tag "v0.4.0" :git/sha "c561cb7"}
+  {:git/tag "v0.4.1" :git/sha "07ab02a"}
 
   ;; Logging
   com.taoensso/timbre {:mvn/version "6.8.0"}}
@@ -15,7 +15,7 @@
  {:dev
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-dsl {:git/tag "v0.4.0" :git/sha "c561cb7"}
+   {io.github.hive-agi/hive-dsl {:git/tag "v0.4.1" :git/sha "07ab02a"}
     io.github.hive-agi/hive-test {:git/tag "v0.2.0" :git/sha "841da83"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
 

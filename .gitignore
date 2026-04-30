@@ -1,2 +1,6 @@
 .cpcache/
 local.deps.edn
+.clj-kondo/
+.lsp/
+target/
+.nrepl-port
