@@ -16,12 +16,12 @@
   {:extra-paths ["test"]
    :extra-deps
    {io.github.hive-agi/hive-dsl {:git/tag "v0.4.1" :git/sha "07ab02a"}
-    io.github.hive-agi/hive-test {:git/tag "v0.2.0" :git/sha "841da83"}
+    io.github.hive-agi/hive-test {:git/tag "v0.2.1" :git/sha "48b480f"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
 
   :test
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-test {:git/tag "v0.2.0" :git/sha "841da83"}
+   {io.github.hive-agi/hive-test {:git/tag "v0.2.1" :git/sha "48b480f"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}
    :main-opts ["-m" "kaocha.runner"]}}}
