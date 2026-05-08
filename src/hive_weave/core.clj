@@ -38,7 +38,8 @@
             [hive-weave.gate :as gate]
             [hive-weave.parallel :as par]
             [hive-weave.pool :as pool]
-            [hive-weave.timed :as timed]))
+            [hive-weave.timed :as timed]
+            [hive-weave.guarded :as guarded]))
 
 ;;; --- Safe Deref & Future ---
 (def deref-safe safe/deref-safe)
@@ -73,3 +74,28 @@
 (def wrap-timed timed/wrap-timed)
 (def ->timed-interceptor timed/->timed-interceptor)
 (def timed-handler timed/timed-handler)
+
+(def guarded-future-call
+  "Run a thunk under :timeout-ms with cleanup hook + injectable alert.
+   On timeout: future-cancel, run :on-cancel on a separate cleanup pool,
+   fire :alert!, return (r/err :weave/timeout {...}). See
+   `hive-weave.guarded` ns doc for the full contract."
+  guarded/guarded-future-call)
+
+(def guarded-await!
+  "Pool-bound counterpart to guarded-future-call. Submits to a
+   ThreadPoolExecutor (via hive-weave.pool/make-pool) and applies the
+   same timeout / cleanup / alert contract, plus pool-stats embedded
+   in the alert event so saturation is visible when timeouts cluster."
+  guarded/guarded-await!)
+
+(defmacro guarded-future
+  "Macro form of guarded-future-call. Body is wrapped as the thunk."
+  [opts & body]
+  `(guarded/guarded-future ~opts ~@body))
+
+(defmacro with-guarded-await
+  "Macro form of guarded-await!. Submits body to pool with cleanup +
+   alert hooks."
+  [pool opts & body]
+  `(guarded/with-guarded-await ~pool ~opts ~@body))
