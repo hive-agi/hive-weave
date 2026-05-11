@@ -134,7 +134,17 @@
   []
   (clojure.lang.Var/cloneThreadBindingFrame))
 
-(defonce ^:private active-conveyor (atom (->BoundFnConveyor)))
+(defonce ^:private active-conveyor
+  ;; Initialized to nil so get-conveyor allocates a fresh BoundFnConveyor
+  ;; on every nil access. This avoids the defonce stale-class pitfall: when
+  ;; this namespace is hot-reloaded, defprotocol/defrecord rebuild fresh
+  ;; vars + classes, but a defonce-held instance still references the OLD
+  ;; class — which the new protocol var does not recognise, producing
+  ;; "No implementation of method: :convey of protocol:
+  ;; #'hive-weave.pool/IBindingConveyor found for class:
+  ;; hive_weave.pool.BoundFnConveyor" at the next async submission.
+  ;; The atom remains writable so set-conveyor! can install test doubles.
+  (atom nil))
 
 (defn set-conveyor!
   "Install conveyor c as the active binding conveyor. Returns prior conveyor."

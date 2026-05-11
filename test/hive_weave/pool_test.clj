@@ -56,6 +56,28 @@
           ret    (pool/set-conveyor! second)]
       (is (= first ret)))))
 
+(deftest get-conveyor-allocates-fresh-when-atom-nil
+  (testing "Regression: after a hot-reload, defonce-cached conveyor instances
+            referenced an OLD BoundFnConveyor class while the new protocol var
+            saw a different class identity, producing
+              \"No implementation of method: :convey of protocol:
+               #'hive-weave.pool/IBindingConveyor found for class:
+               hive_weave.pool.BoundFnConveyor\".
+            Fix: defonce now holds an atom of nil; get-conveyor lazily
+            constructs a fresh BoundFnConveyor every time the atom is nil,
+            so the conveyor's class always matches the currently-loaded
+            protocol var."
+    (reset! @#'hive-weave.pool/active-conveyor nil)
+    (let [c (pool/get-conveyor)]
+      (is (some? c))
+      (is (instance? hive_weave.pool.BoundFnConveyor c)
+          "fallback yields a BoundFnConveyor instance")
+      (is (satisfies? hive-weave.pool/IBindingConveyor c)
+          "fallback instance satisfies the protocol")
+      ;; Exercise the protocol method itself.
+      (binding [*probe* :test]
+        (is (= :test ((pool/convey c (fn [] *probe*)))))))))
+
 ;; =============================================================================
 ;; submit! routes through conveyor
 ;; =============================================================================
