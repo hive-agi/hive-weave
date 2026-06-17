@@ -1,0 +1,12 @@
+{:closed
+ {:name "n", :adt/type :SubmitOutcome, :adt/variant :submit/closed},
+ :ok
+ {:promise :PROMISE-PLACEHOLDER,
+  :adt/type :SubmitOutcome,
+  :adt/variant :submit/ok},
+ :timeout
+ {:name "n",
+  :queue-size 1,
+  :timeout-ms 100,
+  :adt/type :SubmitOutcome,
+  :adt/variant :submit/timeout}}

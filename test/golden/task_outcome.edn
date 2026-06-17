@@ -1,0 +1,7 @@
+{:failed
+ {:class "X",
+  :key :K,
+  :message "boom",
+  :adt/type :TaskOutcome,
+  :adt/variant :task/failed},
+ :ok {:value 42, :adt/type :TaskOutcome, :adt/variant :task/ok}}

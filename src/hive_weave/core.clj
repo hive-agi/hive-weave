@@ -36,6 +36,9 @@
        :after (fn [ctx] ...))"
   (:require [hive-weave.safe :as safe]
             [hive-weave.gate :as gate]
+            [hive-weave.budget :as budget]
+            [hive-weave.heap :as heap]
+            [hive-weave.broker :as broker]
             [hive-weave.parallel :as par]
             [hive-weave.pool :as pool]
             [hive-weave.timed :as timed]
@@ -55,6 +58,28 @@
 (defmacro with-gate-result [g & body] `(gate/with-gate-result ~g ~@body))
 (def deref-gate gate/deref-gate)
 (def gate-stats gate/gate-stats)
+
+;;; --- Budget (unit-agnostic admission control) ---
+(def byte-budget-gate budget/byte-budget-gate)
+(def byte-gate-stats  budget/byte-gate-stats)
+(def with-budget      budget/with-budget)
+(def with-byte-budget budget/with-byte-budget)
+(def byte-fork-join   budget/byte-fork-join)
+
+;;; --- Heap sentinel (JVM heap pressure signal) ---
+(def heap-sample!         heap/sample!)
+(def start-heap-sentinel! heap/start-sentinel!)
+(def stop-heap-sentinel!  heap/stop-sentinel!)
+(def heap-snapshot        heap/snapshot)
+(def heap-observe!        heap/register-observer!)
+(def heap-unobserve!      heap/unregister-observer!)
+
+;;; --- Resource broker (DIP entry — gate + sentinel + policy) ---
+(def start-broker!  broker/start-broker!)
+(def stop-broker!   broker/stop-broker!)
+(def submit         broker/submit)
+(def broker-stats   broker/broker-stats)
+(def decide-policy  broker/decide-policy)
 
 ;;; --- Parallel ---
 (def bounded-pmap par/bounded-pmap)

@@ -12,12 +12,17 @@
    2. `gate-run`  — function, returns Result
    3. `deref-gate` — gated deref for promises/futures with timeout
 
+   Also satisfies hive-weave.budget/IBudgetGate so consumers can depend on
+   the unit-agnostic protocol regardless of whether the underlying gate is
+   slot-permit-based (this ns) or byte-cost-based (hive-weave.budget).
+
    Usage:
      (def db-read (gate {:permits 4 :timeout-ms 15000 :name \"db-read\"}))
 
      (with-gate db-read (query-database ...))
      (deref-gate db-read (chroma/query coll embedding))"
   (:require [hive-dsl.result :as r]
+            [hive-weave.budget :as budget]
             [taoensso.timbre :as log])
   (:import [java.util.concurrent Semaphore TimeUnit]))
 
@@ -147,3 +152,50 @@
      :permits      (:permits g)
      :available    (.availablePermits sem)
      :queue-length (.getQueueLength sem)}))
+
+(extend-type Gate
+  budget/IBudgetGate
+  (-acquire [g cost timeout-ms]
+    (let [^Semaphore sem (:semaphore g)
+          permits        (:permits g)
+          cost           (int (or cost 1))
+          tms            (long (or timeout-ms (:timeout-ms g) 30000))]
+      (cond
+        (or (not (pos? cost)) (> cost permits))
+        (r/err :budget/over-capacity
+               {:name      (:name g)
+                :capacity  permits
+                :unit      :slot
+                :requested cost
+                :hint      "cost exceeds gate permit count; cannot ever admit"})
+
+        :else
+        (if (.tryAcquire sem cost tms TimeUnit/MILLISECONDS)
+          (r/ok cost)
+          (r/err :budget/timeout
+                 {:name       (:name g)
+                  :capacity   permits
+                  :unit       :slot
+                  :requested  cost
+                  :available  (.availablePermits sem)
+                  :timeout-ms tms})))))
+
+  (-release [g cost]
+    (let [^Semaphore sem (:semaphore g)]
+      (.release sem (int (or cost 1)))
+      nil))
+
+  (-stats [g]
+    (let [^Semaphore sem (:semaphore g)
+          permits        (:permits g)
+          available      (.availablePermits sem)]
+      {:name           (:name g)
+       :capacity       permits
+       :unit           :slot
+       :inflight       (- permits available)
+       :available      available
+       :queued         (.getQueueLength sem)
+       :queue-length   (.getQueueLength sem)
+       :admitted-total nil
+       :rejected-total nil
+       :timeout-ms     (:timeout-ms g)})))
