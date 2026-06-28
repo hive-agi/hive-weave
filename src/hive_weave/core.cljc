@@ -42,7 +42,8 @@
             [hive-weave.parallel :as par]
             [hive-weave.pool :as pool]
             [hive-weave.timed :as timed]
-            [hive-weave.guarded :as guarded]))
+            [hive-weave.guarded :as guarded])
+  #?(:cljs (:require-macros [hive-weave.core])))
 
 ;;; --- Safe Deref & Future ---
 (def deref-safe safe/deref-safe)

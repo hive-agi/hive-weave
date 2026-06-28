@@ -2,7 +2,7 @@
 
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
-  org.clojure/core.async {:mvn/version "1.6.681"}
+  org.clojure/core.async {:mvn/version "1.9.865"}
 
   ;; Result types, rescue/guard, lifecycle protocol
   io.github.hive-agi/hive-dsl
@@ -24,4 +24,15 @@
    :extra-deps
    {io.github.hive-agi/hive-test {:git/tag "v0.2.1" :git/sha "48b480f"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}
-   :main-opts ["-m" "kaocha.runner"]}}}
+   :main-opts ["-m" "kaocha.runner"]}
+
+  ;; ClojureScript compile (clj -M:cljs -m cljs.main -t node ...)
+  :cljs
+  {:extra-deps {org.clojure/clojurescript {:mvn/version "1.12.145"}}}
+
+  ;; ClojureScript test suite on node (no npm) — mirrors rewrite-clj
+  :cljs-test
+  {:extra-paths ["test"]
+   :extra-deps {org.clojure/clojurescript {:mvn/version "1.12.145"}
+                olical/cljs-test-runner {:mvn/version "3.8.1"}}
+   :main-opts ["-m" "cljs-test-runner.main" "-x" "node"]}}}

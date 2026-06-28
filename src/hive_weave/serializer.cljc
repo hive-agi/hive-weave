@@ -64,14 +64,28 @@
    `serializer` returns a record. `close!` shuts down the worker
    gracefully (drains the queue then exits via a `:msg/poison`
    message). Repeated `close!` calls are no-ops. After close,
-   `submit!` returns `(submit-outcome :submit/closed)`."
+   `submit!` returns `(submit-outcome :submit/closed)`.
+
+   ## ClojureScript
+
+   Node is single-threaded, so the runtime is *already* a serializer:
+   there is no concurrency to guard against. The JVM machinery — the
+   dedicated worker `Thread`, the bounded `LinkedBlockingQueue`, the
+   `AtomicBoolean` lifecycle, the result `promise`/`deliver` channel —
+   is `:clj`-only. On cljs `submit!` simply runs the work **synchronously
+   in caller order** and wraps the resulting `TaskOutcome` in a derefable
+   (a `delay`). Consequently: there is never a `:submit/timeout` (no
+   bounded queue to fill); `submit-and-wait!`'s wait-timeout is moot (the
+   value is already resolved); and `stats` reports `:queue-size 0`,
+   `:worker-alive? false`. Coalescing is a no-op (nothing is ever pending)."
   (:require [hive-dsl.adt :as adt :refer [defadt adt-case]]
             [hive-dsl.result :as r]
+            [hive-weave.platform :as platform]
             [taoensso.timbre :as log])
-  (:import [java.util.concurrent
-            LinkedBlockingQueue
-            TimeUnit]
-           [java.util.concurrent.atomic AtomicBoolean]))
+  #?(:clj (:import [java.util.concurrent
+                    LinkedBlockingQueue
+                    TimeUnit]
+                   [java.util.concurrent.atomic AtomicBoolean])))
 
 ;; =============================================================================
 ;; ADTs
@@ -84,13 +98,15 @@
      :msg/poison  — shutdown sentinel; worker drains then exits"
   [:msg/task {:key     any?
               :f       fn?
-              :promise (some-fn fn? #(instance? clojure.lang.IDeref %))}]
+              :promise (some-fn fn? #?(:clj  #(instance? clojure.lang.IDeref %)
+                                       :cljs #(satisfies? cljs.core/IDeref %)))}]
   :msg/poison)
 
 (defadt SubmitOutcome
   "What `submit!` returns. Wraps the submission promise on success;
    carries diagnostic data on rejection."
-  [:submit/ok      {:promise (some-fn fn? #(instance? clojure.lang.IDeref %))}]
+  [:submit/ok      {:promise (some-fn fn? #?(:clj  #(instance? clojure.lang.IDeref %)
+                                             :cljs #(satisfies? cljs.core/IDeref %)))}]
   [:submit/timeout {:queue-size int? :timeout-ms int? :name string?}]
   [:submit/closed  {:name string?}])
 
@@ -104,12 +120,16 @@
 ;; =============================================================================
 ;; Serializer record
 ;; =============================================================================
+;;
+;; Field type hints are dropped: on :clj `queue` is a LinkedBlockingQueue,
+;; `worker` a Thread, `closed?` an AtomicBoolean; on :cljs `queue`/`worker`
+;; are nil and `closed?` is a plain atom.
 
 (defrecord Serializer
   [name
-   ^LinkedBlockingQueue queue
-   ^Thread worker
-   ^AtomicBoolean closed?
+   queue
+   worker
+   closed?
    submit-timeout-ms
    coalesce-key-fn])
 
@@ -117,40 +137,47 @@
 ;; Worker loop — exhaustive ADT match
 ;; =============================================================================
 
-(defn- run-task!
-  "Execute a `:msg/task` envelope and deliver the TaskOutcome onto
-   its promise. Exceptions are caught and modelled as `:task/failed`
-   — the worker thread MUST NOT die on a single bad task."
-  [{:keys [key f promise] :as _msg}]
-  (deliver promise
-           (try
-             (task-outcome :task/ok {:value (f)})
-             (catch Throwable t
-               (log/warn "serializer task failed:"
-                         {:key key
-                          :class (str (class t))
-                          :message (.getMessage t)})
-               (task-outcome :task/failed
-                             {:key     key
-                              :class   (str (class t))
-                              :message (.getMessage t)})))))
-
-(defn- worker-loop
-  "Pull `SerializerMsg` values off the queue and dispatch via
-   `adt-case` (exhaustive — adding a variant is a compile-time error
-   here)."
-  [^LinkedBlockingQueue queue serializer-name]
+(defn- task->outcome
+  "Run a task's fn, returning a `TaskOutcome`. Exceptions are caught and
+   modelled as `:task/failed` — the worker thread MUST NOT die on a single
+   bad task."
+  [key f]
   (try
-    (loop []
-      (let [msg (.take queue)]
-        (adt-case SerializerMsg msg
-          :msg/task   (do (run-task! msg) (recur))
-          :msg/poison (log/debug "serializer" serializer-name
-                                 "worker exiting (poison)"))))
-    (catch InterruptedException _
-      (log/debug "serializer" serializer-name "worker interrupted"))
-    (catch Throwable t
-      (log/error "serializer" serializer-name "worker died:" (.getMessage t)))))
+    (task-outcome :task/ok {:value (f)})
+    (catch #?(:clj Throwable :cljs :default) t
+      (log/warn "serializer task failed:"
+                {:key key
+                 :class (platform/ex-class-name t)
+                 :message (ex-message t)})
+      (task-outcome :task/failed
+                    {:key     key
+                     :class   (platform/ex-class-name t)
+                     :message (ex-message t)}))))
+
+#?(:clj
+   (defn- run-task!
+     "Execute a `:msg/task` envelope and deliver the TaskOutcome onto
+      its promise."
+     [{:keys [key f promise] :as _msg}]
+     (deliver promise (task->outcome key f))))
+
+#?(:clj
+   (defn- worker-loop
+     "Pull `SerializerMsg` values off the queue and dispatch via
+      `adt-case` (exhaustive — adding a variant is a compile-time error
+      here)."
+     [^LinkedBlockingQueue queue serializer-name]
+     (try
+       (loop []
+         (let [msg (.take queue)]
+           (adt-case SerializerMsg msg
+             :msg/task   (do (run-task! msg) (recur))
+             :msg/poison (log/debug "serializer" serializer-name
+                                    "worker exiting (poison)"))))
+       (catch InterruptedException _
+         (log/debug "serializer" serializer-name "worker interrupted"))
+       (catch Throwable t
+         (log/error "serializer" serializer-name "worker died:" (.getMessage t))))))
 
 ;; =============================================================================
 ;; Public API
@@ -169,37 +196,44 @@
                           key (or nil). When supplied, a queued task
                           with the same key is replaced by an incoming
                           submission. Set to `nil` to disable
-                          coalescing (default)."
+                          coalescing (default).
+
+   ClojureScript: single-threaded — no worker thread or queue is created;
+   `closed?` is a plain atom. `submit!` runs work synchronously."
   [{:keys [name queue-capacity submit-timeout-ms coalesce-key-fn]
     :or   {name              "serializer"
            queue-capacity    256
            submit-timeout-ms 30000}}]
-  (let [queue   (LinkedBlockingQueue. (int queue-capacity))
-        closed? (AtomicBoolean. false)
-        worker  (doto (Thread. ^Runnable (fn [] (worker-loop queue name))
-                               (str "hive-weave-serializer-" name))
-                  (.setDaemon true)
-                  (.start))]
-    (->Serializer name queue worker closed? submit-timeout-ms coalesce-key-fn)))
+  #?(:clj
+     (let [queue   (LinkedBlockingQueue. (int queue-capacity))
+           closed? (AtomicBoolean. false)
+           worker  (doto (Thread. ^Runnable (fn [] (worker-loop queue name))
+                                  (str "hive-weave-serializer-" name))
+                     (.setDaemon true)
+                     (.start))]
+       (->Serializer name queue worker closed? submit-timeout-ms coalesce-key-fn))
+     :cljs
+     (->Serializer name nil nil (atom false) submit-timeout-ms coalesce-key-fn)))
 
-(defn- coalesce!
-  "Drop the pending task with the same key from the queue. Linear
-   scan over the queue snapshot — acceptable for the modest queue
-   sizes a serializer is sized for. Best-effort: a task may slip
-   through if the worker pulls it concurrently.
+#?(:clj
+   (defn- coalesce!
+     "Drop the pending task with the same key from the queue. Linear
+      scan over the queue snapshot — acceptable for the modest queue
+      sizes a serializer is sized for. Best-effort: a task may slip
+      through if the worker pulls it concurrently.
 
-   No-op when `coalesce-key-fn` is nil (coalescing is opt-in at
-   serializer-construction time — passing `:key` alone does NOT
-   enable it, since `:key` is also valid as opaque diagnostic metadata)."
-  [^LinkedBlockingQueue queue coalesce-key-fn task-key]
-  (when (and coalesce-key-fn task-key)
-    (let [snapshot (vec (.toArray queue))
-          target   (some (fn [m]
-                           (when (and (= :msg/task (adt/adt-variant m))
-                                      (= task-key (:key m)))
-                             m))
-                         snapshot)]
-      (when target (.remove queue target)))))
+      No-op when `coalesce-key-fn` is nil (coalescing is opt-in at
+      serializer-construction time — passing `:key` alone does NOT
+      enable it, since `:key` is also valid as opaque diagnostic metadata)."
+     [^LinkedBlockingQueue queue coalesce-key-fn task-key]
+     (when (and coalesce-key-fn task-key)
+       (let [snapshot (vec (.toArray queue))
+             target   (some (fn [m]
+                              (when (and (= :msg/task (adt/adt-variant m))
+                                         (= task-key (:key m)))
+                                m))
+                            snapshot)]
+         (when target (.remove queue target))))))
 
 (defn submit!
   "Enqueue `f` for serialized execution. Returns a `SubmitOutcome`:
@@ -220,27 +254,36 @@
 
      (let [outcome (submit! s {:key project-id} (fn [] (persist! state)))]
        (when (= :submit/timeout (:adt/variant outcome))
-         (log/warn \"serializer rejected\" outcome)))"
+         (log/warn \"serializer rejected\" outcome)))
+
+   ClojureScript: runs `f` synchronously in caller order and wraps the
+   `TaskOutcome` in a `delay`; never returns `:submit/timeout`."
   ([s f] (submit! s {} f))
-  ([^Serializer s {:keys [key]} f]
+  ([s {:keys [key]} f]
    (cond
-     (.get ^AtomicBoolean (:closed? s))
+     #?(:clj  (.get ^AtomicBoolean (:closed? s))
+        :cljs (deref (:closed? s)))
      (submit-outcome :submit/closed {:name (:name s)})
 
      :else
-     (let [^LinkedBlockingQueue q (:queue s)
-           tms                    (:submit-timeout-ms s)
-           p                      (promise)
-           msg                    (serializer-msg
-                                    :msg/task
-                                    {:key key :f f :promise p})]
-       (coalesce! q (:coalesce-key-fn s) key)
-       (if (.offer q msg tms TimeUnit/MILLISECONDS)
-         (submit-outcome :submit/ok {:promise p})
-         (submit-outcome :submit/timeout
-                         {:queue-size (.size q)
-                          :timeout-ms tms
-                          :name       (:name s)}))))))
+     #?(:clj
+        (let [^LinkedBlockingQueue q (:queue s)
+              tms                    (:submit-timeout-ms s)
+              p                      (promise)
+              msg                    (serializer-msg
+                                      :msg/task
+                                      {:key key :f f :promise p})]
+          (coalesce! q (:coalesce-key-fn s) key)
+          (if (.offer q msg tms TimeUnit/MILLISECONDS)
+            (submit-outcome :submit/ok {:promise p})
+            (submit-outcome :submit/timeout
+                            {:queue-size (.size q)
+                             :timeout-ms tms
+                             :name       (:name s)})))
+        :cljs
+        ;; single-threaded: run now, in caller order; the value is the result
+        (let [outcome (task->outcome key f)]
+          (submit-outcome :submit/ok {:promise (delay outcome)}))))))
 
 (defn submit-and-wait!
   "Submit and block on the result promise. Returns a `TaskOutcome`
@@ -248,16 +291,20 @@
 
    `:wait-timeout-ms` defaults to twice `:submit-timeout-ms`.
    On wait-timeout: `(task-outcome :task/failed {...})` with class
-   :weave.serializer/wait-timeout."
+   :weave.serializer/wait-timeout.
+
+   ClojureScript: the result is already resolved (synchronous submit), so
+   the wait-timeout never fires."
   ([s f] (submit-and-wait! s {} f nil))
   ([s opts f] (submit-and-wait! s opts f nil))
-  ([^Serializer s opts f wait-timeout-ms]
+  ([s opts f wait-timeout-ms]
    (let [outcome (submit! s opts f)]
      (adt-case SubmitOutcome outcome
        :submit/ok
-       (let [^clojure.lang.IDeref p (:promise outcome)
+       (let [p   (:promise outcome)
              tms (or wait-timeout-ms (* 2 (:submit-timeout-ms s)))
-             res (deref p tms ::timeout)]
+             res #?(:clj  (deref p tms ::timeout)
+                    :cljs (deref p))]
          (if (= res ::timeout)
            (task-outcome :task/failed
                          {:key     (:key opts)
@@ -274,29 +321,45 @@
 ;; =============================================================================
 
 (defn stats
-  "Current serializer state for observability."
-  [^Serializer s]
+  "Current serializer state for observability.
+
+   ClojureScript: `:queue-size` is always 0 and `:worker-alive?` false
+   (synchronous, no queue/worker); `:remaining` is nil."
+  [s]
   {:name          (:name s)
-   :queue-size    (.size ^LinkedBlockingQueue (:queue s))
-   :remaining     (.remainingCapacity ^LinkedBlockingQueue (:queue s))
-   :closed?       (.get ^AtomicBoolean (:closed? s))
-   :worker-alive? (.isAlive ^Thread (:worker s))})
+   :queue-size    #?(:clj  (.size ^LinkedBlockingQueue (:queue s))
+                     :cljs 0)
+   :remaining     #?(:clj  (.remainingCapacity ^LinkedBlockingQueue (:queue s))
+                     :cljs nil)
+   :closed?       #?(:clj  (.get ^AtomicBoolean (:closed? s))
+                     :cljs (deref (:closed? s)))
+   :worker-alive? #?(:clj  (.isAlive ^Thread (:worker s))
+                     :cljs false)})
 
 (defn close!
   "Drain the queue, then shut down the worker. Idempotent. After
    close, `submit!` returns `(submit-outcome :submit/closed)`.
 
-   Returns Result with the final stats."
-  [^Serializer s]
-  (let [^AtomicBoolean closed? (:closed? s)]
-    (if (.compareAndSet closed? false true)
-      (let [^LinkedBlockingQueue q (:queue s)
-            ^Thread worker         (:worker s)]
-        (.put q (serializer-msg :msg/poison))
-        (when-not (.isAlive worker)
-          (log/debug "serializer" (:name s) "worker already dead at close"))
-        (r/ok (stats s)))
-      (r/ok (assoc (stats s) :already-closed? true)))))
+   Returns Result with the final stats.
+
+   ClojureScript: flips the `closed?` atom; there is no worker/queue to
+   drain."
+  [s]
+  #?(:clj
+     (let [^AtomicBoolean closed? (:closed? s)]
+       (if (.compareAndSet closed? false true)
+         (let [^LinkedBlockingQueue q (:queue s)
+               ^Thread worker         (:worker s)]
+           (.put q (serializer-msg :msg/poison))
+           (when-not (.isAlive worker)
+             (log/debug "serializer" (:name s) "worker already dead at close"))
+           (r/ok (stats s)))
+         (r/ok (assoc (stats s) :already-closed? true))))
+     :cljs
+     (let [closed? (:closed? s)]
+       (if (compare-and-set! closed? false true)
+         (r/ok (stats s))
+         (r/ok (assoc (stats s) :already-closed? true))))))
 
 ;; =============================================================================
 ;; Result-shape helpers (interop for callers that want :ok/:err idiom)

@@ -1,9 +1,15 @@
 (ns hive-weave.budget
   "Unit-agnostic budget gate. 1 permit = 1 unit; caller picks the unit
    (bytes/MiB/slots/etc). Saturation policy: block up to :timeout-ms,
-   then (r/err :budget/timeout ...)."
-  (:require [hive-dsl.result :as r])
-  (:import [java.util.concurrent Semaphore TimeUnit]))
+   then (r/err :budget/timeout ...).
+
+   ClojureScript: the JVM Semaphore is replaced by the platform atom-semaphore
+   and acquisition is synchronous (single-threaded node has no real
+   contention). The future-based byte-fork-join runs workloads sequentially
+   on cljs; the :timeout-ms admission budget is therefore advisory there."
+  (:require [hive-dsl.result :as r]
+            [hive-weave.platform :as platform])
+  #?(:clj (:import [java.util.concurrent Semaphore TimeUnit])))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -19,7 +25,7 @@
                 :admitted-total :rejected-total :timeout-ms}."))
 
 (defrecord ByteBudgetGate
-  [name capacity unit timeout-ms ^Semaphore semaphore
+  [name capacity unit timeout-ms semaphore
    inflight queued admitted-total rejected-total])
 
 (defn- over-capacity-err [g cost]
@@ -42,10 +48,10 @@
 (extend-type ByteBudgetGate
   IBudgetGate
   (-acquire [g cost timeout-ms]
-    (let [^Semaphore sem (:semaphore g)
-          capacity       (:capacity g)
-          cost           (int cost)
-          tms            (int (or timeout-ms (:timeout-ms g)))]
+    (let [sem      (:semaphore g)
+          capacity (:capacity g)
+          cost     (int cost)
+          tms      (int (or timeout-ms (:timeout-ms g)))]
       (cond
         (or (not (pos? cost)) (> cost capacity))
         (over-capacity-err g cost)
@@ -54,7 +60,8 @@
         (do
           (swap! (:queued g) inc)
           (try
-            (if (.tryAcquire sem cost tms TimeUnit/MILLISECONDS)
+            (if #?(:clj  (.tryAcquire ^Semaphore sem cost tms TimeUnit/MILLISECONDS)
+                   :cljs (platform/sem-try-acquire! sem cost))
               (do
                 (swap! (:inflight g) + cost)
                 (swap! (:admitted-total g) inc)
@@ -64,21 +71,22 @@
               (swap! (:queued g) dec)))))))
 
   (-release [g cost]
-    (let [^Semaphore sem (:semaphore g)
-          cost           (int cost)]
+    (let [sem  (:semaphore g)
+          cost (int cost)]
       (swap! (:inflight g) - cost)
-      (.release sem cost)
+      #?(:clj  (.release ^Semaphore sem cost)
+         :cljs (platform/sem-release! sem cost))
       nil))
 
   (-stats [g]
-    (let [^Semaphore sem (:semaphore g)]
+    (let [sem (:semaphore g)]
       {:name           (:name g)
        :capacity       (:capacity g)
        :unit           (:unit g)
        :inflight       @(:inflight g)
-       :available      (.availablePermits sem)
+       :available      #?(:clj (.availablePermits ^Semaphore sem) :cljs (platform/sem-available sem))
        :queued         @(:queued g)
-       :queue-length   (.getQueueLength sem)
+       :queue-length   #?(:clj (.getQueueLength ^Semaphore sem) :cljs (platform/sem-queue-length sem))
        :admitted-total @(:admitted-total g)
        :rejected-total @(:rejected-total g)
        :timeout-ms     (:timeout-ms g)})))
@@ -91,7 +99,8 @@
   (assert (and (integer? capacity) (pos? capacity))
           "byte-budget-gate requires positive :capacity")
   (->ByteBudgetGate name capacity unit timeout-ms
-                    (Semaphore. (int capacity) (boolean fair?))
+                    #?(:clj  (Semaphore. (int capacity) (boolean fair?))
+                       :cljs (platform/make-semaphore capacity))
                     (atom 0) (atom 0) (atom 0) (atom 0)))
 
 (defn byte-gate-stats [g] (-stats g))
@@ -106,11 +115,11 @@
      (if (r/ok? acq)
        (try
          (r/ok (thunk))
-         (catch Exception e
+         (catch #?(:clj Exception :cljs :default) e
            (r/err :budget/execution-failed
                   {:name    (:name g)
-                   :message (.getMessage e)
-                   :class   (str (class e))}))
+                   :message (ex-message e)
+                   :class   (platform/ex-class-name e)}))
          (finally
            (-release g cost)))
        acq))))
@@ -134,10 +143,10 @@
                       {:task task :count n})))))
 
 (defn ->deadline [total-ms]
-  (+ (System/currentTimeMillis) total-ms))
+  (+ (platform/now-ms) total-ms))
 
 (defn remaining-ms [deadline]
-  (max 0 (- deadline (System/currentTimeMillis))))
+  (max 0 (- deadline (platform/now-ms))))
 
 (defn resolve-outcome
   "Map an awaited outcome onto [key value-or-fallback]. Total fn."
@@ -148,31 +157,44 @@
     (and (map? outcome) (r/err? outcome)) [key fallback]
     :else                                 [key outcome]))
 
-(defn submit-workload [gate workload]
-  (->Submission workload
-                (future (with-budget gate (:cost workload) (:thunk workload)))))
+#?(:clj
+   (defn submit-workload [gate workload]
+     (->Submission workload
+                   (future (with-budget gate (:cost workload) (:thunk workload))))))
 
-(defn await-outcome [submission deadline]
-  (deref (:future submission) (remaining-ms deadline) ::timed-out))
+#?(:clj
+   (defn await-outcome [submission deadline]
+     (deref (:future submission) (remaining-ms deadline) ::timed-out)))
 
-(defn cancel-if-timed-out [submission outcome]
-  (when (= outcome ::timed-out)
-    (future-cancel (:future submission)))
-  outcome)
+#?(:clj
+   (defn cancel-if-timed-out [submission outcome]
+     (when (= outcome ::timed-out)
+       (future-cancel (:future submission)))
+     outcome))
 
-(defn collect-submission [submission deadline]
-  (->> (await-outcome submission deadline)
-       (cancel-if-timed-out submission)
-       (resolve-outcome (:workload submission))))
+#?(:clj
+   (defn collect-submission [submission deadline]
+     (->> (await-outcome submission deadline)
+          (cancel-if-timed-out submission)
+          (resolve-outcome (:workload submission)))))
 
 (defn byte-fork-join
   "Concurrent dispatch under one IBudgetGate. Tasks: [k thunk cost] or
    [k thunk cost fallback]. Returns {k result-or-fallback}.
 
-   Options: :gate (required), :total-ms (default 30000)."
+   Options: :gate (required), :total-ms (default 30000).
+
+   ClojureScript: single-threaded — workloads run sequentially under the
+   gate; :total-ms is advisory."
   [{:keys [gate total-ms] :or {total-ms 30000}} & tasks]
   (assert gate "byte-fork-join requires :gate (an IBudgetGate impl)")
-  (let [workloads   (mapv ->workload tasks)
-        submissions (mapv #(submit-workload gate %) workloads)
-        deadline    (->deadline total-ms)]
-    (into {} (map #(collect-submission % deadline)) submissions)))
+  (let [workloads (mapv ->workload tasks)]
+    #?(:clj
+       (let [submissions (mapv #(submit-workload gate %) workloads)
+             deadline    (->deadline total-ms)]
+         (into {} (map #(collect-submission % deadline)) submissions))
+       :cljs
+       (into {}
+             (map (fn [wl]
+                    (resolve-outcome wl (with-budget gate (:cost wl) (:thunk wl)))))
+             workloads))))
