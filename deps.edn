@@ -5,8 +5,7 @@
   org.clojure/core.async {:mvn/version "1.6.681"}
 
   ;; Result types, rescue/guard, lifecycle protocol
-  io.github.hive-agi/hive-dsl
-  {:git/tag "v0.5.1" :git/sha "335869e"}
+  io.github.hive-agi/hive-dsl {:mvn/version "0.5.2"}
 
   ;; Logging
   com.taoensso/timbre {:mvn/version "6.8.0"}}
@@ -24,4 +23,10 @@
    :extra-deps
    {io.github.hive-agi/hive-test {:git/tag "v0.2.1" :git/sha "48b480f"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}
-   :main-opts ["-m" "kaocha.runner"]}}}
+   :main-opts ["-m" "kaocha.runner"]}
+
+  ;; Clojars publishing (see ../hive-build). version = the repo's VERSION file.
+  :build
+  {:deps {io.github.clojure/tools.build {:mvn/version "0.10.9"}
+          slipset/deps-deploy {:mvn/version "0.2.2"}}
+   :ns-default build}}}
