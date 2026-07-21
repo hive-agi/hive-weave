@@ -14,14 +14,14 @@
  {:dev
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-dsl {:git/tag "v0.5.1" :git/sha "335869e"}
-    io.github.hive-agi/hive-test {:git/tag "v0.2.1" :git/sha "48b480f"}
+   {io.github.hive-agi/hive-dsl {:mvn/version "0.5.2"}
+    io.github.hive-agi/hive-test {:mvn/version "0.3.6"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
 
   :test
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-test {:git/tag "v0.2.1" :git/sha "48b480f"}
+   {io.github.hive-agi/hive-test {:mvn/version "0.3.6"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}
    :main-opts ["-m" "kaocha.runner"]}
 

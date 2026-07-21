@@ -12,7 +12,7 @@
   (:require [hive-dsl.result :as r]
             [hive-weave.safe :as safe]
             [taoensso.timbre :as log])
-  (:import [java.util.concurrent Semaphore TimeUnit]))
+  (:import [java.util.concurrent Executors TimeUnit TimeoutException]))
 
 ;; =============================================================================
 ;; Bounded pmap
@@ -34,25 +34,30 @@
    f coll]
   (if (empty? coll)
     []
-    (let [sem (Semaphore. (int concurrency) true)
-          process (fn [item]
-                    (if (.tryAcquire sem timeout-ms TimeUnit/MILLISECONDS)
-                      (try
-                        (r/rescue-log "bounded-pmap" fallback
-                          (let [fut (future (f item))
-                                result (deref fut timeout-ms ::timed-out)]
-                            (if (= result ::timed-out)
-                              (do (future-cancel fut)
-                                  (log/debug "bounded-pmap: item timed out after" timeout-ms "ms")
-                                  fallback)
-                              result)))
-                        (finally
-                          (.release sem)))
-                      (do (log/debug "bounded-pmap: semaphore acquire timed out")
-                          fallback)))
-          ;; Launch all items eagerly (bounded by semaphore)
-          futures (mapv #(future (process %)) coll)]
-      (mapv #(deref % (* 2 timeout-ms) fallback) futures))))
+    (let [pool (Executors/newFixedThreadPool (int concurrency))]
+      (try
+        (let [tasks (mapv (fn [item]
+                            (.submit pool
+                                     ^java.util.concurrent.Callable
+                                     (fn []
+                                       (r/rescue-log "bounded-pmap" fallback
+                                         (f item)))))
+                          coll)
+              batches (long (Math/ceil (/ (count coll) (double concurrency))))
+              deadline (+ (System/currentTimeMillis) (* timeout-ms batches))]
+          (mapv (fn [task]
+                  (let [remaining (max 1 (- deadline (System/currentTimeMillis)))]
+                    (try
+                      (.get task remaining TimeUnit/MILLISECONDS)
+                      (catch TimeoutException _
+                        (.cancel task true)
+                        (log/debug "bounded-pmap: item timed out after" timeout-ms "ms")
+                        fallback)
+                      (catch Exception _
+                        fallback))))
+                tasks))
+        (finally
+          (.shutdownNow pool))))))
 
 ;; =============================================================================
 ;; Fork-Join
