@@ -22,8 +22,7 @@
      (with-gate db-read (query-database ...))
      (deref-gate db-read (chroma/query coll embedding))"
   (:require [hive-dsl.result :as r]
-            [hive-weave.budget :as budget]
-            [taoensso.timbre :as log])
+            [hive-weave.budget :as budget])
   (:import [java.util.concurrent Semaphore TimeUnit]))
 
 ;; =============================================================================

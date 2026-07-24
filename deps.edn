@@ -5,16 +5,18 @@
   org.clojure/core.async {:mvn/version "1.6.681"}
 
   ;; Result types, rescue/guard, lifecycle protocol
-  io.github.hive-agi/hive-dsl {:mvn/version "0.5.8"}
+  io.github.hive-agi/hive-dsl {:mvn/version "0.5.9"}
 
   ;; Logging
-  com.taoensso/timbre {:mvn/version "6.8.0"}}
+  com.taoensso/timbre {:mvn/version "6.8.0"}
+  metosin/malli {:mvn/version "0.20.1"}
+  org.typedclojure/typed.clj.runtime {:mvn/version "1.4.0"}}
 
  :aliases
  {:dev
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-dsl {:mvn/version "0.5.8"}
+   {io.github.hive-agi/hive-dsl {:mvn/version "0.5.9"}
     io.github.hive-agi/hive-test {:mvn/version "0.3.10"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
 
@@ -22,11 +24,14 @@
   {:extra-paths ["test"]
    :extra-deps
    {io.github.hive-agi/hive-test {:mvn/version "0.3.10"}
-    lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+    lambdaisland/kaocha {:mvn/version "1.91.1392"}
+    io.github.hive-agi/hive-schemas {:mvn/version "0.1.11"}}
    :main-opts ["-m" "kaocha.runner"]}
 
   ;; Clojars publishing (see ../hive-build). version = the repo's VERSION file.
   :build
   {:deps {io.github.clojure/tools.build {:mvn/version "0.10.9"}
           slipset/deps-deploy {:mvn/version "0.2.2"}}
-   :ns-default build}}}
+   :ns-default build}
+  :typed {:extra-paths ["dev-typed"]
+          :extra-deps {org.typedclojure/typed.clj.checker {:mvn/version "1.4.0"}}}}}

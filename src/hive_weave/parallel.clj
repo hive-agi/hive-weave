@@ -10,7 +10,6 @@
    2. Have timeouts (no indefinite hangs)
    3. Return fallback values on timeout (graceful degradation)"
   (:require [hive-dsl.result :as r]
-            [hive-weave.safe :as safe]
             [taoensso.timbre :as log])
   (:import [java.util.concurrent Executors TimeUnit TimeoutException]))
 

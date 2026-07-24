@@ -1,5 +1,5 @@
 (ns hive-weave.broker-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is]]
             [hive-dsl.result :as r]
             [hive-weave.broker :as br]))
 
