@@ -5,7 +5,7 @@
   org.clojure/core.async {:mvn/version "1.9.865"}
 
   ;; Result types, rescue/guard, lifecycle protocol
-  io.github.hive-agi/hive-dsl {:mvn/version "0.5.20"}
+  io.github.hive-agi/hive-dsl {:mvn/version "0.5.21"}
 
   ;; Logging
   com.taoensso/timbre {:mvn/version "6.8.0"}
@@ -16,14 +16,14 @@
  {:dev
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-dsl {:mvn/version "0.5.20"}
-    io.github.hive-agi/hive-test {:mvn/version "0.3.16"}
+   {io.github.hive-agi/hive-dsl {:mvn/version "0.5.21"}
+    io.github.hive-agi/hive-test {:mvn/version "0.3.17"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
 
   :test
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-test {:mvn/version "0.3.16"}
+   {io.github.hive-agi/hive-test {:mvn/version "0.3.17"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}
     io.github.hive-agi/hive-schemas {:mvn/version "0.1.29"}}
    :main-opts ["-m" "kaocha.runner"]}
