@@ -17,13 +17,13 @@
   {:extra-paths ["test"]
    :extra-deps
    {io.github.hive-agi/hive-dsl {:mvn/version "0.5.21"}
-    io.github.hive-agi/hive-test {:mvn/version "0.3.17"}
+    io.github.hive-agi/hive-test {:mvn/version "0.4.0"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
 
   :test
   {:extra-paths ["test"]
    :extra-deps
-   {io.github.hive-agi/hive-test {:mvn/version "0.3.17"}
+   {io.github.hive-agi/hive-test {:mvn/version "0.4.0"}
     lambdaisland/kaocha {:mvn/version "1.91.1392"}
     io.github.hive-agi/hive-schemas {:mvn/version "0.1.29"}}
    :main-opts ["-m" "kaocha.runner"]}
