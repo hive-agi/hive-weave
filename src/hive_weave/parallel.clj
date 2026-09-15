@@ -10,7 +10,8 @@
    2. Have timeouts (no indefinite hangs)
    3. Return fallback values on timeout (graceful degradation)"
   (:require [hive-dsl.result :as r]
-            [taoensso.timbre :as log])
+            [taoensso.timbre :as log]
+            [hive-weave.stack :as stack])
   (:import [java.util.concurrent Executors TimeUnit TimeoutException]))
 
 ;; =============================================================================
@@ -21,19 +22,28 @@
   "Like pmap but with bounded concurrency and per-item timeout.
 
    Options:
-     :concurrency — max parallel workers (default 4)
-     :timeout-ms  — per-item timeout in ms (default 10000)
-     :fallback    — value for timed-out/failed items (default nil)
+     :concurrency max parallel workers (default 4)
+     :timeout-ms  per-item timeout in ms (default 10000)
+     :fallback    value for timed-out/failed items (default nil)
+     :stack-bytes explicit worker stack size (default: the JVM's)
 
    (bounded-pmap {:concurrency 3 :timeout-ms 5000}
      fetch-entry-preview entry-ids)
-   ;; => [result1 result2 nil result4 ...]  (nil = timed out)"
-  [{:keys [concurrency timeout-ms fallback]
+   ;; => [result1 result2 nil result4 ...]  (nil = timed out)
+
+   Pass :stack-bytes when `f` calls into native code that recurses: the default
+   worker stack is sized for Clojure, and a native overflow is a SIGSEGV that
+   takes the process down instead of yielding the fallback (hive-weave.stack)."
+  [{:keys [concurrency timeout-ms fallback stack-bytes]
     :or   {concurrency 4 timeout-ms 10000 fallback nil}}
    f coll]
   (if (empty? coll)
     []
-    (let [pool (Executors/newFixedThreadPool (int concurrency))]
+    (let [pool (if stack-bytes
+                 (Executors/newFixedThreadPool
+                  (int concurrency)
+                  (stack/thread-factory {:name "bounded-pmap" :stack-bytes stack-bytes}))
+                 (Executors/newFixedThreadPool (int concurrency)))]
       (try
         (let [tasks (mapv (fn [item]
                             (.submit pool

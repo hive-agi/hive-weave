@@ -25,7 +25,8 @@
                 (fn [] (query-database ...))
                 {:timeout-ms 5000 :fallback ::db-timeout})
      ;; => result or ::db-timeout"
-  (:require [taoensso.timbre :as log])
+  (:require [taoensso.timbre :as log]
+            [hive-weave.stack :as stack])
   (:import [java.util.concurrent
             ThreadPoolExecutor
             LinkedBlockingQueue
@@ -42,13 +43,21 @@
 
 (defn- named-thread-factory
   "ThreadFactory that names threads `<prefix>-<n>` and sets them daemon
-   so they don't block JVM shutdown."
-  ^ThreadFactory [^String prefix]
-  (let [counter (atom 0)]
-    (reify ThreadFactory
-      (newThread [_ runnable]
-        (doto (Thread. runnable (str prefix "-" (swap! counter inc)))
-          (.setDaemon true))))))
+   so they don't block JVM shutdown.
+
+   `stack-bytes`, when given, sizes every thread's stack explicitly. Native work
+   that recurses (an ONNX session build, a deep JNI call) overflows the default
+   stack INSIDE native code, which is a SIGSEGV that kills the process rather
+   than a StackOverflowError anyone can catch. See hive-weave.stack."
+  (^ThreadFactory [^String prefix] (named-thread-factory prefix nil))
+  (^ThreadFactory [^String prefix stack-bytes]
+   (if stack-bytes
+     (stack/thread-factory {:name prefix :stack-bytes stack-bytes})
+     (let [counter (atom 0)]
+       (reify ThreadFactory
+         (newThread [_ runnable]
+           (doto (Thread. runnable (str prefix "-" (swap! counter inc)))
+             (.setDaemon true))))))))
 
 ;; =============================================================================
 ;; Pool Factory
@@ -62,17 +71,25 @@
   "Create a bounded fixed-size ThreadPoolExecutor.
 
    Options:
-     :name           — thread-name prefix and diagnostic label (required)
-     :size           — fixed pool size (required)
-     :queue-capacity — bounded LinkedBlockingQueue capacity (default 256)
-     :keep-alive-s   — idle keep-alive in seconds (default 60)
+     :name           thread-name prefix and diagnostic label (required)
+     :size           fixed pool size (required)
+     :queue-capacity bounded LinkedBlockingQueue capacity (default 256)
+     :keep-alive-s   idle keep-alive in seconds (default 60)
+     :stack-bytes    explicit worker stack size (default: the JVM's)
 
    CallerRunsPolicy is always used: when both workers and queue are
    saturated, the submitting thread runs the task itself. This provides
    upstream backpressure instead of unbounded thread creation or
-   silent task drops."
+   silent task drops.
+
+   Pass :stack-bytes when the tasks call into native code that recurses. A
+   native stack overflow is a SIGSEGV, not an exception, so a pool sized for
+   Clojure work will take the whole process down with it (hive-weave.stack).
+   Note that CallerRunsPolicy runs a rejected task on the CALLER's stack, which
+   this option cannot size: keep the queue big enough that native work is not
+   pushed back onto the submitter."
   ^ThreadPoolExecutor
-  [{:keys [name size queue-capacity keep-alive-s]
+  [{:keys [name size queue-capacity keep-alive-s stack-bytes]
     :or   {queue-capacity default-queue-capacity
            keep-alive-s   60}}]
   {:pre [(string? name) (pos-int? size)]}
@@ -82,7 +99,7 @@
    (long keep-alive-s)
    TimeUnit/SECONDS
    (LinkedBlockingQueue. (int queue-capacity))
-   (named-thread-factory name)
+   (named-thread-factory name stack-bytes)
    (ThreadPoolExecutor$CallerRunsPolicy.)))
 
 ;; =============================================================================
