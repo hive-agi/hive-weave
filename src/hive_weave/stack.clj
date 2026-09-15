@@ -45,7 +45,13 @@
           (.setDaemon (boolean daemon?)))))))
 
 (defn call-with-stack
-  "Invoke `f` on a fresh thread with a `stack-bytes` stack and return its value.
+  "Invoke `f` on a fresh thread with an explicit stack and return its value.
+
+   Arities: `(call-with-stack f)` uses `default-stack-bytes`,
+   `(call-with-stack stack-bytes f)` names the size, and
+   `(call-with-stack {:stack-bytes n :name \"...\"} f)` also names the thread, so
+   a thread dump taken during the call says which seam the native frames belong
+   to.
 
    A throwable from `f` is rethrown on the CALLING thread, so this is invisible
    to the error handling around it: try/catch and Result guards keep working
@@ -56,15 +62,20 @@
    (loading a model, building a session), not for a hot path; for repeated work
    build a pool with `thread-factory` instead."
   ([f] (call-with-stack default-stack-bytes f))
-  ([stack-bytes f]
-   (let [result (volatile! nil)
+  ([stack-bytes-or-opts f]
+   (let [{:keys [stack-bytes name]
+          :or   {stack-bytes default-stack-bytes name "weave-stack-call"}}
+         (if (map? stack-bytes-or-opts)
+           stack-bytes-or-opts
+           {:stack-bytes stack-bytes-or-opts})
+         result (volatile! nil)
          thrown (volatile! nil)
          t      (Thread. nil
                          ^Runnable (fn []
                                      (try
                                        (vreset! result (f))
                                        (catch Throwable e (vreset! thrown e))))
-                         "weave-stack-call"
+                         ^String name
                          (long stack-bytes))]
      (.start t)
      (.join t)
