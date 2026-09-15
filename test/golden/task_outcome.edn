@@ -1,7 +1,12 @@
 {:failed
- {:class "X",
+ {:causes [{:class "Y", :message "root", :data nil}],
+  :class "X",
+  :context {:endpoint "h:1"},
+  :data {:a 1},
   :key :K,
+  :label "milvus-upsert",
   :message "boom",
+  :serializer "sz",
   :adt/type :TaskOutcome,
   :adt/variant :task/failed},
  :ok {:value 42, :adt/type :TaskOutcome, :adt/variant :task/ok}}

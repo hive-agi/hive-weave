@@ -57,9 +57,25 @@
    :apply?      true
    :xf          (fn [m] (into (sorted-map) m))
    :cases       {:ok     [:task/ok     {:value 42}]
-                 :failed [:task/failed {:key :K :class "X" :message "boom"}]}
+                 :failed [:task/failed {:key        :K
+                                        :label      "milvus-upsert"
+                                        :context    {:endpoint "h:1"}
+                                        :serializer "sz"
+                                        :class      "X"
+                                        :message    "boom"
+                                        :data       {:a 1}
+                                        :causes     [{:class   "Y"
+                                                      :message "root"
+                                                      :data    nil}]}]}
    :gen         (gen/elements [[:task/ok     {:value 1}]
-                               [:task/failed {:key :K :class "X" :message "m"}]])
+                               [:task/failed {:key        :K
+                                              :label      "l"
+                                              :context    {}
+                                              :serializer "sz"
+                                              :class      "X"
+                                              :message    "m"
+                                              :data       nil
+                                              :causes     []}]])
    :pred        adt/adt?})
 
 ;; =============================================================================
@@ -96,7 +112,67 @@
                                           (fn [] (throw (ex-info "boom" {}))))]
           (is (= :task/failed (adt/adt-variant outcome)))
           (is (= "boom" (:message outcome)))
-          (is (= :K (:key outcome))))))))
+          (is (= :K (:key outcome)))
+          (is (= "fail" (:serializer outcome))
+              "the failure names the serializer that ran it")))))
+
+  (testing "task/failed carries the caller's label + context"
+    (with-serializer {:name "ctx" :queue-capacity 4 :submit-timeout-ms 500}
+      (fn [sz]
+        (let [outcome (s/submit-and-wait!
+                        sz
+                        {:label   "milvus-upsert"
+                         :context {:endpoint "10.104.172.142:19530"}}
+                        (fn [] (throw (java.net.ConnectException.
+                                        "Connection refused"))))]
+          (is (= :task/failed (adt/adt-variant outcome)))
+          (is (nil? (:key outcome)) "no key submitted, so :key stays nil")
+          (is (= "milvus-upsert" (:label outcome)))
+          (is (= {:endpoint "10.104.172.142:19530"} (:context outcome))
+              "the endpoint the dial was aimed at survives into the outcome")
+          (is (= "class java.net.ConnectException" (:class outcome)))))))
+
+  (testing "task/failed carries ex-data and the cause chain"
+    (with-serializer {:name "causes" :queue-capacity 4 :submit-timeout-ms 500}
+      (fn [sz]
+        (let [root    (java.net.ConnectException. "Connection refused")
+              middle  (ex-info "rpc failed" {:rpc :upsert} root)
+              outcome (s/submit-and-wait! sz {:label "kg-write"}
+                                          (fn [] (throw (ex-info "write failed"
+                                                                 {:collection "memory"}
+                                                                 middle))))]
+          (is (= {:collection "memory"} (:data outcome)))
+          (is (= ["class clojure.lang.ExceptionInfo"
+                  "class java.net.ConnectException"]
+                 (mapv :class (:causes outcome)))
+              "every cause below the thrown throwable is recorded, outermost first")
+          (is (= ["rpc failed" "Connection refused"]
+                 (mapv :message (:causes outcome))))
+          (is (= [{:rpc :upsert} nil] (mapv :data (:causes outcome))))))))
+
+  (testing "a throwable with no message still yields a string message"
+    (with-serializer {:name "nomsg" :queue-capacity 4 :submit-timeout-ms 500}
+      (fn [sz]
+        (let [outcome (s/submit-and-wait! sz {} (fn [] (throw (NullPointerException.))))]
+          (is (string? (:message outcome)))
+          (is (= [] (:causes outcome)))))))
+
+  (testing "a wait-timeout failure keeps the caller's label + context"
+    (with-serializer {:name "slow" :queue-capacity 4 :submit-timeout-ms 500}
+      (fn [sz]
+        (let [outcome (s/submit-and-wait! sz
+                                          {:key :K
+                                           :label "slow-write"
+                                           :context {:endpoint "h:1"}}
+                                          (fn [] (Thread/sleep 400))
+                                          50)]
+          (is (= :task/failed (adt/adt-variant outcome)))
+          (is (= "weave.serializer/wait-timeout" (:class outcome)))
+          (is (= :K (:key outcome)))
+          (is (= "slow-write" (:label outcome)))
+          (is (= {:endpoint "h:1"} (:context outcome)))
+          (is (= "slow" (:serializer outcome)))
+          (is (= {:wait-timeout-ms 50} (:data outcome))))))))
 
 (deftest coalescing
   (testing "same coalesce key replaces a queued task — only the latest runs"

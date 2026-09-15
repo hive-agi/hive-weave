@@ -29,7 +29,7 @@
    Two closed ADTs make the message and outcome surface explicit:
 
      SerializerMsg — what flows through the queue
-       :msg/task         { :key, :f, :promise }
+       :msg/task         { :key, :label, :context, :f, :promise }
        :msg/poison
 
      SubmitOutcome — what `submit!` returns
@@ -39,7 +39,8 @@
 
      TaskOutcome   — what the submission promise resolves to
        :task/ok          { :value }
-       :task/failed      { :class :message }
+       :task/failed      { :key :label :context :serializer
+                           :class :message :data :causes }
 
    Domain ADTs make the worker loop a `adt-case` exhaustive match —
    no string-typing, no half-cases.
@@ -80,9 +81,13 @@
 (defadt SerializerMsg
   "Messages flowing through a serializer's work queue.
 
-     :msg/task    — work envelope: caller's fn + the promise to fill
+     :msg/task    — work envelope: caller's fn, the promise to fill, and
+                    the caller's own diagnostic context (:label, :context)
+                    carried so a failure can name what the work was for
      :msg/poison  — shutdown sentinel; worker drains then exits"
   [:msg/task {:key     any?
+              :label   any?
+              :context any?
               :f       fn?
               :promise (some-fn fn? #(instance? clojure.lang.IDeref %))}]
   :msg/poison)
@@ -97,9 +102,26 @@
 (defadt TaskOutcome
   "What the submission promise resolves to once the worker runs the
    task. `:task/ok` carries whatever `f` returned; `:task/failed`
-   describes the throwable."
+   describes the throwable AND names who submitted it.
+
+   `:task/failed` fields:
+     :key        — the submission key (nil when the caller passed none)
+     :label      — caller-supplied short name for the work (nil when absent)
+     :context    — caller-supplied diagnostic map, e.g. {:endpoint \"host:port\"}
+     :serializer — name of the serializer whose worker ran the task
+     :class      — (str (class t)) of the throwable
+     :message    — its message, never nil
+     :data       — (ex-data t), nil for a plain throwable
+     :causes     — vector of {:class :message :data} for each cause below it"
   [:task/ok     {:value any?}]
-  [:task/failed {:key any? :class string? :message string?}])
+  [:task/failed {:key        any?
+                 :label      any?
+                 :context    any?
+                 :serializer any?
+                 :class      string?
+                 :message    string?
+                 :data       any?
+                 :causes     vector?}])
 
 ;; =============================================================================
 ;; Serializer record
@@ -117,23 +139,50 @@
 ;; Worker loop — exhaustive ADT match
 ;; =============================================================================
 
+(def ^:private max-cause-depth
+  "How many causes below the thrown throwable a failure payload records."
+  8)
+
+(defn- cause-chain
+  "Causes BELOW `t`, outermost first, as a vector of
+   {:class :message :data}. Depth-capped at `max-cause-depth` and
+   cycle-safe: a self-referential cause chain terminates."
+  [^Throwable t]
+  (loop [c (.getCause t), seen #{}, acc []]
+    (if (or (nil? c) (contains? seen c) (>= (count acc) max-cause-depth))
+      acc
+      (recur (.getCause c)
+             (conj seen c)
+             (conj acc {:class   (str (class c))
+                        :message (or (ex-message c) (str c))
+                        :data    (ex-data c)})))))
+
+(defn- task-failure
+  "Diagnostic payload for a task that threw: the caller's identity
+   (:key, :label, :context), the serializer that ran it, and the
+   throwable's class, message, ex-data and cause chain."
+  [{:keys [key label context]} serializer-name ^Throwable t]
+  {:key        key
+   :label      label
+   :context    context
+   :serializer serializer-name
+   :class      (str (class t))
+   :message    (or (ex-message t) (str t))
+   :data       (ex-data t)
+   :causes     (cause-chain t)})
+
 (defn- run-task!
   "Execute a `:msg/task` envelope and deliver the TaskOutcome onto
    its promise. Exceptions are caught and modelled as `:task/failed`
    — the worker thread MUST NOT die on a single bad task."
-  [{:keys [key f promise] :as _msg}]
+  [{:keys [f promise] :as msg} serializer-name]
   (deliver promise
            (try
              (task-outcome :task/ok {:value (f)})
              (catch Throwable t
-               (log/warn "serializer task failed:"
-                         {:key key
-                          :class (str (class t))
-                          :message (.getMessage t)})
-               (task-outcome :task/failed
-                             {:key     key
-                              :class   (str (class t))
-                              :message (.getMessage t)})))))
+               (let [payload (task-failure msg serializer-name t)]
+                 (log/warn "serializer task failed:" payload)
+                 (task-outcome :task/failed payload))))))
 
 (defn- worker-loop
   "Pull `SerializerMsg` values off the queue and dispatch via
@@ -144,7 +193,7 @@
     (loop []
       (let [msg (.take queue)]
         (adt-case SerializerMsg msg
-          :msg/task   (do (run-task! msg) (recur))
+          :msg/task   (do (run-task! msg serializer-name) (recur))
           :msg/poison (log/debug "serializer" serializer-name
                                  "worker exiting (poison)"))))
     (catch InterruptedException _
@@ -212,17 +261,24 @@
    Submission may **block** up to `:submit-timeout-ms` if the queue
    is full (true backpressure — caller can't outrun the worker).
 
-   `:key` enables coalescing — a pending task with the same key is
-   replaced before enqueue. Useful for repeated-state-write workloads
-   where the upsert is idempotent on a unique key.
+   Opts, all optional (default nil — existing callers are unaffected):
+     :key     — enables coalescing: a pending task with the same key is
+                replaced before enqueue.
+     :label   — short name for the work, e.g. \"milvus-upsert\".
+     :context — diagnostic map travelling with the task, echoed verbatim
+                in a `:task/failed` outcome and in the failure log line,
+                e.g. {:endpoint \"10.104.172.142:19530\" :collection \"memory\"}.
 
    Usage — fire-and-forget with side-channel logging:
 
-     (let [outcome (submit! s {:key project-id} (fn [] (persist! state)))]
+     (let [outcome (submit! s {:key     project-id
+                               :label   \"milvus-upsert\"
+                               :context {:endpoint (str host \":\" port)}}
+                            (fn [] (persist! state)))]
        (when (= :submit/timeout (:adt/variant outcome))
          (log/warn \"serializer rejected\" outcome)))"
   ([s f] (submit! s {} f))
-  ([^Serializer s {:keys [key]} f]
+  ([^Serializer s {:keys [key label context]} f]
    (cond
      (.get ^AtomicBoolean (:closed? s))
      (submit-outcome :submit/closed {:name (:name s)})
@@ -233,7 +289,11 @@
            p                      (promise)
            msg                    (serializer-msg
                                     :msg/task
-                                    {:key key :f f :promise p})]
+                                    {:key     key
+                                     :label   label
+                                     :context context
+                                     :f       f
+                                     :promise p})]
        (coalesce! q (:coalesce-key-fn s) key)
        (if (.offer q msg tms TimeUnit/MILLISECONDS)
          (submit-outcome :submit/ok {:promise p})
@@ -248,7 +308,8 @@
 
    `:wait-timeout-ms` defaults to twice `:submit-timeout-ms`.
    On wait-timeout: `(task-outcome :task/failed {...})` with class
-   :weave.serializer/wait-timeout."
+   :weave.serializer/wait-timeout, carrying the same `:key`, `:label`
+   and `:context` the caller submitted."
   ([s f] (submit-and-wait! s {} f nil))
   ([s opts f] (submit-and-wait! s opts f nil))
   ([^Serializer s opts f wait-timeout-ms]
@@ -260,10 +321,15 @@
              res (deref p tms ::timeout)]
          (if (= res ::timeout)
            (task-outcome :task/failed
-                         {:key     (:key opts)
-                          :class   "weave.serializer/wait-timeout"
-                          :message (str "Task accepted but did not finish within "
-                                        tms "ms.")})
+                         {:key        (:key opts)
+                          :label      (:label opts)
+                          :context    (:context opts)
+                          :serializer (:name s)
+                          :class      "weave.serializer/wait-timeout"
+                          :message    (str "Task accepted but did not finish within "
+                                           tms "ms.")
+                          :data       {:wait-timeout-ms tms}
+                          :causes     []})
            res))
 
        :submit/timeout outcome
