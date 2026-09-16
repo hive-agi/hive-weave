@@ -1,0 +1,6 @@
+{:project-id "hive-weave"
+ :parent "hive"
+ :description "Parallelism and resilience substrate — parallel execution, retry, gates, guarded/timed calls, budgets, heap-pressure awareness, a broker and safe serialization. Foundation leaf under most of the fleet."
+ :language :clojure
+ :tags ["foundation" "parallelism" "resilience" "retry" "budget" "heap"]
+ :carto {:source-roots ["resources" "src" "test"]}}
