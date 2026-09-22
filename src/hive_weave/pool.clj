@@ -133,6 +133,58 @@
    ^RejectedExecutionHandler ((rejection-handlers rejection))))
 
 ;; =============================================================================
+;; Virtual threads — for work whose scarce resource is not the thread
+;; =============================================================================
+
+(defn virtual-threads?
+  "Whether this JVM can start a virtual thread per task (Java 21+).
+
+   Asked reflectively so that loading this namespace on an older JVM costs
+   nothing: a direct call to `Executors/newVirtualThreadPerTaskExecutor` links
+   at class load and fails there rather than here, where the caller can choose."
+  []
+  (boolean
+   (try
+     (.getMethod java.util.concurrent.Executors "newVirtualThreadPerTaskExecutor"
+                 (into-array Class []))
+     (catch NoSuchMethodException _ false)
+     (catch Exception _ false))))
+
+(defn virtual-executor
+  "An ExecutorService that starts one virtual thread per task.
+
+   A virtual thread costs a few hundred bytes and parks instead of holding a
+   carrier while it blocks, so the thread stops being the scarce thing. What
+   that removes is the THREAD ceiling; it removes no other ceiling, which is
+   why this is normally paired with a gate or a budget over whatever is
+   actually finite (connections, GPU memory, a provider's rate limit).
+
+   Throws on a JVM older than 21 rather than silently degrading, because a
+   caller that asked for unbounded concurrency and quietly got 32 threads would
+   be the worst of both."
+  ^ExecutorService []
+  (when-not (virtual-threads?)
+    (throw (ex-info "virtual threads need Java 21 or newer"
+                    {:java (System/getProperty "java.version")})))
+  (clojure.lang.Reflector/invokeStaticMethod
+   java.util.concurrent.Executors "newVirtualThreadPerTaskExecutor" (object-array 0)))
+
+(defn io-executor
+  "The executor to run BLOCKING IO on: virtual threads where the JVM has them,
+   otherwise a bounded pool of `:fallback-size` platform threads (default 64).
+
+   Use it when the work waits on something and the thread itself is the only
+   thing being rationed. Keep `make-pool` for CPU-bound work, where a pool
+   sized near the core count is the point, and put a gate or budget in front of
+   whatever the work contends for.
+
+   Options: :name, :fallback-size, plus anything `make-pool` takes."
+  ^ExecutorService [{:keys [name fallback-size] :or {fallback-size 64} :as opts}]
+  (if (virtual-threads?)
+    (virtual-executor)
+    (make-pool (merge {:size fallback-size} opts {:name (or name "io")}))))
+
+;; =============================================================================
 ;; Binding Conveyor (DIP) — make dynvar conveyance swappable across thread boundaries
 ;; =============================================================================
 ;;
