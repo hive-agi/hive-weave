@@ -10,7 +10,17 @@ on:
       - 'src/**'
       - 'resources/**'
       - 'deps.edn'
+  # A minor or major release is a decision, not a side effect of a push, so it
+  # is made here and still goes through the same gate: tests first, one
+  # version minted by CI, never by a laptop.
   workflow_dispatch:
+    inputs:
+      level:
+        description: 'Version level to bump'
+        required: false
+        default: patch
+        type: choice
+        options: [patch, minor, major]
 
 concurrency:
   group: release-${{ github.ref }}
@@ -44,8 +54,10 @@ jobs:
       - name: Run tests
         run: clojure -M:test
 
-      - name: Bump patch version
-        run: clojure -T:build bump :level :patch
+      # A push always mints a patch. Only a hand-dispatched run may ask for
+      # more, which is why the default here is patch rather than the input.
+      - name: Bump version
+        run: clojure -T:build bump :level :${{ github.event.inputs.level || 'patch' }}
 
       - name: Commit and tag
         run: |
