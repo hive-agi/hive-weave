@@ -178,11 +178,17 @@
    sized near the core count is the point, and put a gate or budget in front of
    whatever the work contends for.
 
-   Options: :name, :fallback-size, plus anything `make-pool` takes."
-  ^ExecutorService [{:keys [name fallback-size] :or {fallback-size 64} :as opts}]
-  (if (virtual-threads?)
+   Options: :name, :fallback-size, :virtual? (defaults to what this JVM can
+   do), plus anything `make-pool` takes. `:virtual? false` forces the pool,
+   which is how the fallback stays testable on a JVM that has virtual threads."
+  ^ExecutorService [{:keys [name fallback-size virtual?]
+                     :or   {fallback-size 64}
+                     :as   opts}]
+  (if (if (some? virtual?) virtual? (virtual-threads?))
     (virtual-executor)
-    (make-pool (merge {:size fallback-size} opts {:name (or name "io")}))))
+    (make-pool (merge {:size fallback-size}
+                      (dissoc opts :virtual? :fallback-size)
+                      {:name (or name "io")}))))
 
 ;; =============================================================================
 ;; Binding Conveyor (DIP) — make dynvar conveyance swappable across thread boundaries

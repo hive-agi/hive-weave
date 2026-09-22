@@ -26,6 +26,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Pinned, not inherited: this library ships a virtual-thread executor,
+      # and on a runner below 21 those tests take their fallback branch, so the
+      # feature would ship having been exercised only on a developer's machine.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
       - uses: DeLaGuardo/setup-clojure@13.0
         with:
           cli: latest
