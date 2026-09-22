@@ -11,7 +11,9 @@
 
    All primitives return within their timeout budget. No exceptions."
   (:require [hive-dsl.result :as r]
-            [taoensso.timbre :as log]))
+            [taoensso.timbre :as log]
+            [hive-weave.pool :as pool])
+  (:import [java.util.concurrent RejectedExecutionException]))
 
 ;; =============================================================================
 ;; Safe Deref
@@ -45,36 +47,54 @@
 ;; =============================================================================
 
 (defn safe-future-call
-  "Execute f in a future with timeout. Returns Result.
+  "Execute f with a timeout. Returns Result.
 
    (safe-future-call {:timeout-ms 5000} #(expensive-computation))
-   ;; => (ok result) or (err :weave/timeout {...}) or (err :weave/exception {...})
+   (safe-future-call {:timeout-ms 5000 :pool io-pool} #(slow-read))
 
    Options:
      :timeout-ms — max execution time (required)
-     :name       — diagnostic label (optional)"
-  [{:keys [timeout-ms name] :or {name "anonymous"}} f]
+     :name       — diagnostic label (optional)
+     :pool       — ExecutorService to run f on (optional)
+
+   Without :pool, f runs on `clojure.core/future`, whose pool is UNBOUNDED. A
+   timeout only interrupts, so work that does not observe interruption keeps
+   its thread; N timed-out calls hold N threads. Pass a bounded :pool wherever
+   timeouts are expected, and the ceiling is the pool instead of the heap.
+   A saturated :abort pool returns (err :weave/rejected ...) rather than
+   running the work on the caller."
+  [{:keys [timeout-ms name pool] :or {name "anonymous"}} f]
   {:pre [(pos-int? timeout-ms)]}
-  (let [fut (future
-              (try
-                (f)
-                (catch Throwable t
-                  {::exception t})))
-        result (deref fut timeout-ms ::timed-out)]
-    (cond
-      (= result ::timed-out)
-      (do (log/warn "safe-future" name "timed out after" timeout-ms "ms")
-          (future-cancel fut)
-          (r/err :weave/timeout {:name name :timeout-ms timeout-ms}))
+  (let [wrapped (fn []
+                  (try
+                    (f)
+                    (catch Throwable t
+                      {::exception t})))
+        fut     (try
+                  (if pool
+                    (pool/submit! pool wrapped)
+                    (future (wrapped)))
+                  (catch RejectedExecutionException _
+                    ::rejected))]
+    (if (= ::rejected fut)
+      (do (log/warn "safe-future" name "rejected: pool saturated")
+          (r/err :weave/rejected {:name name
+                                  :pool (pool/pool-stats pool)}))
+      (let [result (deref fut timeout-ms ::timed-out)]
+        (cond
+          (= result ::timed-out)
+          (do (log/warn "safe-future" name "timed out after" timeout-ms "ms")
+              (future-cancel fut)
+              (r/err :weave/timeout {:name name :timeout-ms timeout-ms}))
 
-      (and (map? result) (::exception result))
-      (let [ex (::exception result)]
-        (r/err :weave/exception {:name name
-                                 :message (.getMessage ^Throwable ex)
-                                 :class (str (class ex))}))
+          (and (map? result) (::exception result))
+          (let [ex (::exception result)]
+            (r/err :weave/exception {:name name
+                                     :message (.getMessage ^Throwable ex)
+                                     :class (str (class ex))}))
 
-      :else
-      (r/ok result))))
+          :else
+          (r/ok result))))))
 
 (defmacro safe-future
   "Execute body in a future with timeout. Returns Result.

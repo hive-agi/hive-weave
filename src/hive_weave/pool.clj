@@ -35,7 +35,10 @@
             TimeUnit
             ThreadPoolExecutor$CallerRunsPolicy
             Future
-            RejectedExecutionException]))
+            RejectedExecutionException]
+[java.util.concurrent ThreadPoolExecutor$AbortPolicy]
+[java.util.concurrent ExecutorService]
+[java.util.concurrent RejectedExecutionHandler]))
 
 ;; =============================================================================
 ;; Thread Factory
@@ -67,6 +70,30 @@
   "Bounded queue capacity for a pool. Tasks beyond this trigger CallerRunsPolicy."
   256)
 
+(def ^:private rejection-handlers
+  {:caller-runs #(ThreadPoolExecutor$CallerRunsPolicy.)
+   :abort       #(ThreadPoolExecutor$AbortPolicy.)})
+
+(defn- rejection-of
+  "The :rejection keyword a pool was built with, or :custom."
+  [^ThreadPoolExecutor pool]
+  (condp instance? (.getRejectedExecutionHandler pool)
+    ThreadPoolExecutor$CallerRunsPolicy :caller-runs
+    ThreadPoolExecutor$AbortPolicy      :abort
+    :custom))
+
+(def ^:private rejection-handlers
+  {:caller-runs #(ThreadPoolExecutor$CallerRunsPolicy.)
+   :abort       #(ThreadPoolExecutor$AbortPolicy.)})
+
+(defn- rejection-of
+  "The :rejection policy a pool was built with, or :custom."
+  [^ThreadPoolExecutor pool]
+  (condp instance? (.getRejectedExecutionHandler pool)
+    ThreadPoolExecutor$CallerRunsPolicy :caller-runs
+    ThreadPoolExecutor$AbortPolicy      :abort
+    :custom))
+
 (defn make-pool
   "Create a bounded fixed-size ThreadPoolExecutor.
 
@@ -76,11 +103,13 @@
      :queue-capacity bounded LinkedBlockingQueue capacity (default 256)
      :keep-alive-s   idle keep-alive in seconds (default 60)
      :stack-bytes    explicit worker stack size (default: the JVM's)
+     :rejection      what happens once workers AND queue are full:
+                       :caller-runs (default) — the submitting thread runs it
+                       :abort — submit! throws RejectedExecutionException
 
-   CallerRunsPolicy is always used: when both workers and queue are
-   saturated, the submitting thread runs the task itself. This provides
-   upstream backpressure instead of unbounded thread creation or
-   silent task drops.
+   :caller-runs never drops work but blocks the submitter, which is wrong when
+   the submitter is a request thread that should shed load instead. Choose
+   :abort there and answer the rejection.
 
    Pass :stack-bytes when the tasks call into native code that recurses. A
    native stack overflow is a SIGSEGV, not an exception, so a pool sized for
@@ -89,10 +118,11 @@
    this option cannot size: keep the queue big enough that native work is not
    pushed back onto the submitter."
   ^ThreadPoolExecutor
-  [{:keys [name size queue-capacity keep-alive-s stack-bytes]
+  [{:keys [name size queue-capacity keep-alive-s stack-bytes rejection]
     :or   {queue-capacity default-queue-capacity
-           keep-alive-s   60}}]
-  {:pre [(string? name) (pos-int? size)]}
+           keep-alive-s   60
+           rejection      :caller-runs}}]
+  {:pre [(string? name) (pos-int? size) (contains? rejection-handlers rejection)]}
   (ThreadPoolExecutor.
    (int size)                                           ; core pool size
    (int size)                                           ; max pool size (fixed)
@@ -100,7 +130,7 @@
    TimeUnit/SECONDS
    (LinkedBlockingQueue. (int queue-capacity))
    (named-thread-factory name stack-bytes)
-   (ThreadPoolExecutor$CallerRunsPolicy.)))
+   ^RejectedExecutionHandler ((rejection-handlers rejection))))
 
 ;; =============================================================================
 ;; Binding Conveyor (DIP) — make dynvar conveyance swappable across thread boundaries
@@ -215,41 +245,57 @@
    trap where code relying on `binding` loses its frame at the pool
    boundary.
 
-   On RejectedExecutionException (pool shut down), runs `f` on the
-   caller thread and returns a synthetic already-completed Future."
-  ^Future [^ThreadPoolExecutor pool ^Callable f]
+   A rejection from a SHUT DOWN pool runs `f` on the caller thread and returns
+   an already-completed Future: the work was accepted before the shutdown race
+   and still has to happen. A rejection from a SATURATED `:abort` pool is
+   rethrown — that one is load shedding, and swallowing it would turn the
+   policy the caller asked for back into :caller-runs."
+  ^Future [^ExecutorService pool ^Callable f]
   (let [bf (convey-fn f)]
     (try
       (.submit pool ^Callable bf)
-      (catch RejectedExecutionException _
-        (rejected-fallback-future (bf))))))
+      (catch RejectedExecutionException e
+        (if (.isShutdown pool)
+          (rejected-fallback-future (bf))
+          (throw e))))))
 
 (defn await!
   "Submit `f` to `pool` and block on its result up to `:timeout-ms`.
 
    On timeout, cancels the task (with interrupt) and returns `:fallback`.
    On exception during execution, logs and returns `:fallback`.
+   A saturated `:abort` pool also yields `:fallback`, logged as a rejection.
 
    Never hangs indefinitely.
 
+   This BLOCKS the calling thread. Inside an async server (an aleph handler,
+   a netty event-loop thread) that is the thing you are trying to avoid:
+   there, submit! and compose on the Future instead.
+
    Options:
      :timeout-ms — max wait in ms (required)
-     :fallback   — value returned on timeout or exception (default nil)
+     :fallback   — value returned on timeout, exception or rejection (default nil)
      :name       — diagnostic label used in logs (default \"pool-task\")"
-  [^ThreadPoolExecutor pool ^Callable f
+  [^ExecutorService pool ^Callable f
    {:keys [timeout-ms fallback name]
     :or   {name "pool-task"}}]
   {:pre [(pos-int? timeout-ms)]}
-  (let [fut (submit! pool f)]
-    (try
-      (.get ^Future fut (long timeout-ms) TimeUnit/MILLISECONDS)
-      (catch TimeoutException _
-        (.cancel ^Future fut true)
-        (log/warn "pool" name "task timed out after" timeout-ms "ms")
-        fallback)
-      (catch Exception e
-        (log/warn e "pool" name "task failed:" (.getMessage e))
-        fallback))))
+  (let [fut (try
+              (submit! pool f)
+              (catch RejectedExecutionException _
+                (log/warn "pool" name "rejected: saturated")
+                ::rejected))]
+    (if (= ::rejected fut)
+      fallback
+      (try
+        (.get ^Future fut (long timeout-ms) TimeUnit/MILLISECONDS)
+        (catch TimeoutException _
+          (.cancel ^Future fut true)
+          (log/warn "pool" name "task timed out after" timeout-ms "ms")
+          fallback)
+        (catch Exception e
+          (log/warn e "pool" name "task failed:" (.getMessage e))
+          fallback)))))
 
 (defmacro with-pool-await
   "Submit body to `pool`, block up to (:timeout-ms opts), return
@@ -265,19 +311,34 @@
 ;; =============================================================================
 
 (defn pool-stats
-  "Snapshot of a pool's runtime counters."
-  [^ThreadPoolExecutor pool]
-  {:active         (.getActiveCount pool)
-   :queued         (.size (.getQueue pool))
-   :pool-size      (.getPoolSize pool)
-   :max-pool-size  (.getMaximumPoolSize pool)
-   :completed-tasks (.getCompletedTaskCount pool)})
+  "Snapshot of an executor's runtime counters.
+
+   Every ExecutorService answers: :executor (class name), :shutdown?,
+   :terminated?. A ThreadPoolExecutor additionally answers its counters and
+   the :rejection policy it was built with.
+
+   Written against the INTERFACE because the executors weave has to live
+   beside are not all ThreadPoolExecutors: manifold's and aleph's are
+   dirigiste `Executor`s, which extend AbstractExecutorService, and a
+   ThreadPoolExecutor-shaped read of one throws ClassCastException."
+  [^ExecutorService pool]
+  (merge {:executor    (.getName (class pool))
+          :shutdown?   (.isShutdown pool)
+          :terminated? (.isTerminated pool)}
+         (when (instance? ThreadPoolExecutor pool)
+           (let [^ThreadPoolExecutor tpe pool]
+             {:active          (.getActiveCount tpe)
+              :queued          (.size (.getQueue tpe))
+              :pool-size       (.getPoolSize tpe)
+              :max-pool-size   (.getMaximumPoolSize tpe)
+              :completed-tasks (.getCompletedTaskCount tpe)
+              :rejection       (rejection-of tpe)}))))
 
 (defn shutdown!
   "Orderly shutdown: stop accepting new tasks, wait up to
    `:await-ms` for in-flight tasks, then force-shutdown.
    Default `:await-ms` is 5000."
-  [^ThreadPoolExecutor pool & [{:keys [await-ms] :or {await-ms 5000}}]]
+  [^ExecutorService pool & [{:keys [await-ms] :or {await-ms 5000}}]]
   (.shutdown pool)
   (when-not (.awaitTermination pool (long await-ms) TimeUnit/MILLISECONDS)
     (.shutdownNow pool)))

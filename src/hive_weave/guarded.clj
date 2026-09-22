@@ -44,7 +44,8 @@
             ExecutorService
             Future
             TimeUnit
-            TimeoutException]))
+            TimeoutException]
+           [java.util.concurrent RejectedExecutionException]))
 
 ;; =============================================================================
 ;; Cleanup pool — single shared daemon executor for :on-cancel hooks
@@ -102,7 +103,7 @@
 ;; =============================================================================
 
 (defn guarded-future-call
-  "Run `f` in a future under `:timeout-ms`. On timeout: future-cancel
+  "Run `f` under `:timeout-ms`. On timeout: future-cancel
    (interrupt), submit `:on-cancel` to the cleanup pool, fire `:alert!`,
    return `(r/err :weave/timeout {...})`. On exception: fire `:alert!`,
    return `(r/err :weave/exception {...})`. Otherwise `(r/ok value)`.
@@ -110,58 +111,76 @@
    Options:
      :timeout-ms          — required, pos-int.
      :name                — diagnostic label (default \"guarded\").
+     :pool                — ExecutorService to run `f` on. Without it `f` runs
+                            on clojure.core/future, whose pool is unbounded;
+                            abandoned work then holds a thread each.
      :on-cancel           — 0-arg cleanup thunk; only fires on timeout.
      :cleanup-timeout-ms  — wall-time cap on :on-cancel (default 5000).
      :alert!              — (event-map) -> any. Event keys:
                               :event :weave/task-killed | :weave/task-failed
+                                     | :weave/task-rejected
                               :name :timeout-ms :elapsed-ms :reason
                               :cleanup-result (only on timeout)
                               :exception (only on :weave/task-failed)"
-  [{:keys [timeout-ms name on-cancel cleanup-timeout-ms alert!]
+  [{:keys [timeout-ms name pool on-cancel cleanup-timeout-ms alert!]
     :or   {name "guarded" cleanup-timeout-ms 5000}}
    f]
   {:pre [(pos-int? timeout-ms) (fn? f)]}
   (let [emit!     (->alert! alert!)
         started   (System/currentTimeMillis)
         bf        (pool/convey-fn f)
-        fut       (future
+        wrapped   (fn []
                     (try
                       (bf)
                       (catch Throwable t {::exception t})))
-        result    (deref fut timeout-ms ::timed-out)
-        elapsed   (- (System/currentTimeMillis) started)]
-    (cond
-      (= result ::timed-out)
-      (let [_ (future-cancel fut)
-            cleanup-result (run-cleanup! name on-cancel cleanup-timeout-ms)]
-        (log/warn "guarded" name "timed out after" timeout-ms "ms — cleanup:" cleanup-result)
-        (emit! {:event          :weave/task-killed
-                :name           name
-                :timeout-ms     timeout-ms
-                :elapsed-ms     elapsed
-                :reason         :timeout
-                :cleanup-result cleanup-result})
-        (r/err :weave/timeout {:name           name
-                               :timeout-ms     timeout-ms
-                               :elapsed-ms     elapsed
-                               :cleanup-result cleanup-result}))
+        fut       (try
+                    (if pool
+                      (pool/submit! pool wrapped)
+                      (future (wrapped)))
+                    (catch RejectedExecutionException _ ::rejected))]
+    (if (= ::rejected fut)
+      (do (log/warn "guarded" name "rejected: pool saturated")
+          (emit! {:event      :weave/task-rejected
+                  :name       name
+                  :timeout-ms timeout-ms
+                  :elapsed-ms (- (System/currentTimeMillis) started)
+                  :reason     :rejected})
+          (r/err :weave/rejected {:name name
+                                  :pool (pool/pool-stats pool)}))
+      (let [result  (deref fut timeout-ms ::timed-out)
+            elapsed (- (System/currentTimeMillis) started)]
+        (cond
+          (= result ::timed-out)
+          (let [_ (future-cancel fut)
+                cleanup-result (run-cleanup! name on-cancel cleanup-timeout-ms)]
+            (log/warn "guarded" name "timed out after" timeout-ms "ms — cleanup:" cleanup-result)
+            (emit! {:event          :weave/task-killed
+                    :name           name
+                    :timeout-ms     timeout-ms
+                    :elapsed-ms     elapsed
+                    :reason         :timeout
+                    :cleanup-result cleanup-result})
+            (r/err :weave/timeout {:name           name
+                                   :timeout-ms     timeout-ms
+                                   :elapsed-ms     elapsed
+                                   :cleanup-result cleanup-result}))
 
-      (and (map? result) (::exception result))
-      (let [^Throwable ex (::exception result)]
-        (log/warn ex "guarded" name "threw:" (.getMessage ex))
-        (emit! {:event      :weave/task-failed
-                :name       name
-                :elapsed-ms elapsed
-                :reason     :exception
-                :exception  {:message (.getMessage ex)
-                             :class   (str (class ex))}})
-        (r/err :weave/exception {:name       name
-                                 :elapsed-ms elapsed
-                                 :message    (.getMessage ex)
-                                 :class      (str (class ex))}))
+          (and (map? result) (::exception result))
+          (let [^Throwable ex (::exception result)]
+            (log/warn ex "guarded" name "threw:" (.getMessage ex))
+            (emit! {:event      :weave/task-failed
+                    :name       name
+                    :elapsed-ms elapsed
+                    :reason     :exception
+                    :exception  {:message (.getMessage ex)
+                                 :class   (str (class ex))}})
+            (r/err :weave/exception {:name       name
+                                     :elapsed-ms elapsed
+                                     :message    (.getMessage ex)
+                                     :class      (str (class ex))}))
 
-      :else
-      (r/ok result))))
+          :else
+          (r/ok result))))))
 
 (defmacro guarded-future
   "Macro form of guarded-future-call. Body is wrapped as the thunk.
@@ -179,57 +198,71 @@
 
 (defn guarded-await!
   "Pool-bound counterpart to `guarded-future-call`. Submits `f` to
-   `pool` (a `java.util.concurrent.ThreadPoolExecutor` from
-   `hive-weave.pool/make-pool`) and blocks up to `:timeout-ms`. Same
-   timeout / cancel / alert / cleanup contract as
-   `guarded-future-call`, plus pool-stats embedded in the alert event
-   so callers can see saturation when timeouts cluster.
+   `exec` (any ExecutorService, e.g. one from `hive-weave.pool/make-pool`)
+   and blocks up to `:timeout-ms`. Same timeout / cancel / alert / cleanup
+   contract as `guarded-future-call`, plus pool-stats embedded in the alert
+   event so callers can see saturation when timeouts cluster.
 
-   Options: see `guarded-future-call`. Additionally:
-     :pool — required (the ThreadPoolExecutor)."
-  [^java.util.concurrent.ThreadPoolExecutor exec ^Callable f
+   A saturated `:abort` pool yields (err :weave/rejected ...) and a
+   :weave/task-rejected alert, so shed load is reported rather than silently
+   run on the caller.
+
+   Options: see `guarded-future-call`."
+  [^ExecutorService exec ^Callable f
    {:keys [timeout-ms name on-cancel cleanup-timeout-ms alert!]
     :or   {name "guarded" cleanup-timeout-ms 5000}}]
   {:pre [(pos-int? timeout-ms) (fn? f)]}
   (let [emit!   (->alert! alert!)
         started (System/currentTimeMillis)
-        fut     (pool/submit! exec f)]
-    (try
-      (let [v (.get ^Future fut (long timeout-ms) TimeUnit/MILLISECONDS)]
-        (r/ok v))
-      (catch TimeoutException _
-        (.cancel ^Future fut true)
-        (let [elapsed        (- (System/currentTimeMillis) started)
-              cleanup-result (run-cleanup! name on-cancel cleanup-timeout-ms)
-              stats          (pool/pool-stats exec)]
-          (log/warn "guarded-pool" name "timed out after" timeout-ms
-                    "ms — cleanup:" cleanup-result "pool:" stats)
-          (emit! {:event          :weave/task-killed
-                  :name           name
-                  :timeout-ms     timeout-ms
-                  :elapsed-ms     elapsed
-                  :reason         :timeout
-                  :cleanup-result cleanup-result
-                  :pool-stats     stats})
-          (r/err :weave/timeout {:name           name
-                                 :timeout-ms     timeout-ms
-                                 :elapsed-ms     elapsed
-                                 :cleanup-result cleanup-result
-                                 :pool-stats     stats})))
-      (catch Exception e
-        (let [elapsed (- (System/currentTimeMillis) started)
-              ex      (or (.getCause e) e)]
-          (log/warn ex "guarded-pool" name "failed:" (.getMessage ex))
-          (emit! {:event      :weave/task-failed
-                  :name       name
-                  :elapsed-ms elapsed
-                  :reason     :exception
-                  :exception  {:message (.getMessage ^Throwable ex)
-                               :class   (str (class ex))}})
-          (r/err :weave/exception {:name       name
-                                   :elapsed-ms elapsed
-                                   :message    (.getMessage ^Throwable ex)
-                                   :class      (str (class ex))}))))))
+        fut     (try
+                  (pool/submit! exec f)
+                  (catch RejectedExecutionException _ ::rejected))]
+    (if (= ::rejected fut)
+      (let [stats (pool/pool-stats exec)]
+        (log/warn "guarded-pool" name "rejected — pool:" stats)
+        (emit! {:event      :weave/task-rejected
+                :name       name
+                :timeout-ms timeout-ms
+                :elapsed-ms (- (System/currentTimeMillis) started)
+                :reason     :rejected
+                :pool-stats stats})
+        (r/err :weave/rejected {:name name :pool stats}))
+      (try
+        (let [v (.get ^Future fut (long timeout-ms) TimeUnit/MILLISECONDS)]
+          (r/ok v))
+        (catch TimeoutException _
+          (.cancel ^Future fut true)
+          (let [elapsed        (- (System/currentTimeMillis) started)
+                cleanup-result (run-cleanup! name on-cancel cleanup-timeout-ms)
+                stats          (pool/pool-stats exec)]
+            (log/warn "guarded-pool" name "timed out after" timeout-ms
+                      "ms — cleanup:" cleanup-result "pool:" stats)
+            (emit! {:event          :weave/task-killed
+                    :name           name
+                    :timeout-ms     timeout-ms
+                    :elapsed-ms     elapsed
+                    :reason         :timeout
+                    :cleanup-result cleanup-result
+                    :pool-stats     stats})
+            (r/err :weave/timeout {:name           name
+                                   :timeout-ms     timeout-ms
+                                   :elapsed-ms     elapsed
+                                   :cleanup-result cleanup-result
+                                   :pool-stats     stats})))
+        (catch Exception e
+          (let [elapsed (- (System/currentTimeMillis) started)
+                ex      (or (.getCause e) e)]
+            (log/warn ex "guarded-pool" name "failed:" (.getMessage ex))
+            (emit! {:event      :weave/task-failed
+                    :name       name
+                    :elapsed-ms elapsed
+                    :reason     :exception
+                    :exception  {:message (.getMessage ^Throwable ex)
+                                 :class   (str (class ex))}})
+            (r/err :weave/exception {:name       name
+                                     :elapsed-ms elapsed
+                                     :message    (.getMessage ^Throwable ex)
+                                     :class      (str (class ex))})))))))
 
 (defmacro with-guarded-await
   "Macro form of guarded-await!. Submits body to pool with cleanup +

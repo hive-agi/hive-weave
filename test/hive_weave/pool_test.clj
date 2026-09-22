@@ -100,3 +100,61 @@
           (let [fut (pool/submit! p (fn [] *probe*))]
             (is (= :root (.get fut)))))
         (finally (pool/shutdown! p))))))
+
+;; =============================================================================
+;; Rejection policy + executor-agnostic surface
+;; =============================================================================
+
+(defn- saturate!
+  "Occupy every worker and queue slot of p with tasks parked on latch."
+  [p ^java.util.concurrent.CountDownLatch latch n]
+  (dotimes [_ n] (pool/submit! p (fn [] (.await latch)))))
+
+(deftest abort-rejection-surfaces-saturation
+  (testing ":rejection :abort throws RejectedExecutionException instead of running on the caller"
+    (let [p     (pool/make-pool {:name "test-abort" :size 1 :queue-capacity 1 :rejection :abort})
+          latch (java.util.concurrent.CountDownLatch. 1)]
+      (try
+        (saturate! p latch 2)
+        (is (thrown? java.util.concurrent.RejectedExecutionException
+                     (pool/submit! p (fn [] :never))))
+        (finally (.countDown latch) (pool/shutdown! p))))))
+
+(deftest caller-runs-is-the-default
+  (testing "a saturated default pool runs overflow work on the submitting thread"
+    (let [p     (pool/make-pool {:name "test-cr" :size 1 :queue-capacity 1})
+          latch (java.util.concurrent.CountDownLatch. 1)
+          me    (Thread/currentThread)]
+      (try
+        (saturate! p latch 2)
+        (is (identical? me (.get ^java.util.concurrent.Future
+                                 (pool/submit! p (fn [] (Thread/currentThread))))))
+        (finally (.countDown latch) (pool/shutdown! p))))))
+
+(deftest unknown-rejection-policy-is-refused
+  (is (thrown? AssertionError (pool/make-pool {:name "bad" :size 1 :rejection :drop}))))
+
+(deftest submit!-on-shutdown-pool-runs-on-caller
+  (let [p (pool/make-pool {:name "test-down" :size 1 :rejection :abort})]
+    (pool/shutdown! p)
+    (is (= :ran (.get ^java.util.concurrent.Future (pool/submit! p (fn [] :ran)))))))
+
+(deftest pool-stats-accepts-any-executor-service
+  (testing "a non-ThreadPoolExecutor executor yields stats instead of ClassCastException"
+    (let [fj (java.util.concurrent.ForkJoinPool. 2)]
+      (try
+        (let [s (pool/pool-stats fj)]
+          (is (false? (:shutdown? s)))
+          (is (= "java.util.concurrent.ForkJoinPool" (:executor s))))
+        (finally (.shutdown fj))))
+    (let [p (pool/make-pool {:name "test-stats" :size 2 :rejection :abort})]
+      (try
+        (is (= {:max-pool-size 2 :rejection :abort :shutdown? false}
+               (select-keys (pool/pool-stats p) [:max-pool-size :rejection :shutdown?])))
+        (finally (pool/shutdown! p))))))
+
+(deftest await!-accepts-any-executor-service
+  (let [fj (java.util.concurrent.ForkJoinPool. 1)]
+    (try
+      (is (= 42 (pool/await! fj (fn [] 42) {:timeout-ms 1000})))
+      (finally (.shutdown fj)))))
