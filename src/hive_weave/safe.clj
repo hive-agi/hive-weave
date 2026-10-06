@@ -13,7 +13,7 @@
   (:require [hive-dsl.result :as r]
             [taoensso.timbre :as log]
             [hive-weave.pool :as pool])
-  (:import [java.util.concurrent RejectedExecutionException]))
+  (:import))
 
 ;; =============================================================================
 ;; Safe Deref
@@ -74,8 +74,8 @@
                   (if pool
                     (pool/submit! pool wrapped)
                     (future (wrapped)))
-                  (catch RejectedExecutionException _
-                    ::rejected))]
+                  (catch RuntimeException e
+                    (if (pool/rejected? e) ::rejected (throw e))))]
     (if (= ::rejected fut)
       (do (log/warn "safe-future" name "rejected: pool saturated")
           (r/err :weave/rejected {:name name
