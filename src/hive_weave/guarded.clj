@@ -44,8 +44,7 @@
             ExecutorService
             Future
             TimeUnit
-            TimeoutException]
-           [java.util.concurrent RejectedExecutionException]))
+            TimeoutException]))
 
 ;; =============================================================================
 ;; Cleanup pool — single shared daemon executor for :on-cancel hooks
@@ -137,7 +136,7 @@
                     (if pool
                       (pool/submit! pool wrapped)
                       (future (wrapped)))
-                    (catch RejectedExecutionException _ ::rejected))]
+                    (catch RuntimeException e (if (pool/rejected? e) ::rejected (throw e))))]
     (if (= ::rejected fut)
       (do (log/warn "guarded" name "rejected: pool saturated")
           (emit! {:event      :weave/task-rejected
@@ -216,7 +215,7 @@
         started (System/currentTimeMillis)
         fut     (try
                   (pool/submit! exec f)
-                  (catch RejectedExecutionException _ ::rejected))]
+                  (catch RuntimeException e (if (pool/rejected? e) ::rejected (throw e))))]
     (if (= ::rejected fut)
       (let [stats (pool/pool-stats exec)]
         (log/warn "guarded-pool" name "rejected — pool:" stats)

@@ -73,6 +73,17 @@ jobs:
       - name: Resolve declared classpath
         run: clojure -P
 
+      # bb-depsolve and other bb tools load hive-weave.parallel. A JVM-only
+      # class in an :import or catch clause (RejectedExecutionException,
+      # clojure.lang.Reflector) makes the namespace unloadable under babashka,
+      # and the JVM suite cannot see it: 0.3.20 through 0.4.1 shipped that way.
+      - name: Loads under babashka
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/bb-install https://raw.githubusercontent.com/babashka/babashka/master/install
+          sudo bash /tmp/bb-install
+          bb -cp "$(clojure -Spath)" -e "(require 'hive-weave.pool 'hive-weave.parallel 'hive-weave.safe 'hive-weave.guarded) (println :bb-load-ok)"
+
       - name: Test
         run: |
           set -euo pipefail

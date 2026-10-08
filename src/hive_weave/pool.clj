@@ -34,11 +34,9 @@
             TimeoutException
             TimeUnit
             ThreadPoolExecutor$CallerRunsPolicy
-            Future
-            RejectedExecutionException]
+            Future]
 [java.util.concurrent ThreadPoolExecutor$AbortPolicy]
-[java.util.concurrent ExecutorService]
-[java.util.concurrent RejectedExecutionHandler]))
+[java.util.concurrent ExecutorService]))
 
 ;; =============================================================================
 ;; Thread Factory
@@ -82,18 +80,6 @@
     ThreadPoolExecutor$AbortPolicy      :abort
     :custom))
 
-(def ^:private rejection-handlers
-  {:caller-runs #(ThreadPoolExecutor$CallerRunsPolicy.)
-   :abort       #(ThreadPoolExecutor$AbortPolicy.)})
-
-(defn- rejection-of
-  "The :rejection policy a pool was built with, or :custom."
-  [^ThreadPoolExecutor pool]
-  (condp instance? (.getRejectedExecutionHandler pool)
-    ThreadPoolExecutor$CallerRunsPolicy :caller-runs
-    ThreadPoolExecutor$AbortPolicy      :abort
-    :custom))
-
 (defn make-pool
   "Create a bounded fixed-size ThreadPoolExecutor.
 
@@ -130,7 +116,7 @@
    TimeUnit/SECONDS
    (LinkedBlockingQueue. (int queue-capacity))
    (named-thread-factory name stack-bytes)
-   ^RejectedExecutionHandler ((rejection-handlers rejection))))
+   ^java.util.concurrent.RejectedExecutionHandler ((rejection-handlers rejection))))
 
 ;; =============================================================================
 ;; Virtual threads — for work whose scarce resource is not the thread
@@ -161,13 +147,17 @@
 
    Throws on a JVM older than 21 rather than silently degrading, because a
    caller that asked for unbounded concurrency and quietly got 32 threads would
-   be the worst of both."
+   be the worst of both.
+
+   Called through java.lang.reflect rather than clojure.lang.Reflector, which
+   babashka does not expose."
   ^ExecutorService []
   (when-not (virtual-threads?)
     (throw (ex-info "virtual threads need Java 21 or newer"
                     {:java (System/getProperty "java.version")})))
-  (clojure.lang.Reflector/invokeStaticMethod
-   java.util.concurrent.Executors "newVirtualThreadPerTaskExecutor" (object-array 0)))
+  (.invoke (.getMethod java.util.concurrent.Executors "newVirtualThreadPerTaskExecutor"
+                       (into-array Class []))
+           nil (object-array 0)))
 
 (defn io-executor
   "The executor to run BLOCKING IO on: virtual threads where the JVM has them,
@@ -293,6 +283,16 @@
     (isCancelled [_] false)
     (cancel [_ _] false)))
 
+(defn rejected?
+  "Whether `e` is a java.util.concurrent.RejectedExecutionException.
+
+   Tested by class name rather than caught by class because babashka does not
+   expose that class: naming it in an :import or a catch clause makes the
+   namespace unloadable there, and with it every bb tool that reaches
+   hive-weave.parallel. Catch RuntimeException and ask this instead."
+  [e]
+  (= "java.util.concurrent.RejectedExecutionException" (.getName (class e))))
+
 (defn submit!
   "Submit `f` to `pool`, returning a java.util.concurrent.Future.
 
@@ -312,8 +312,8 @@
   (let [bf (convey-fn f)]
     (try
       (.submit pool ^Callable bf)
-      (catch RejectedExecutionException e
-        (if (.isShutdown pool)
+      (catch RuntimeException e
+        (if (and (rejected? e) (.isShutdown pool))
           (rejected-fallback-future (bf))
           (throw e))))))
 
@@ -340,9 +340,11 @@
   {:pre [(pos-int? timeout-ms)]}
   (let [fut (try
               (submit! pool f)
-              (catch RejectedExecutionException _
-                (log/warn "pool" name "rejected: saturated")
-                ::rejected))]
+              (catch RuntimeException e
+                (if (rejected? e)
+                  (do (log/warn "pool" name "rejected: saturated")
+                      ::rejected)
+                  (throw e))))]
     (if (= ::rejected fut)
       fallback
       (try
