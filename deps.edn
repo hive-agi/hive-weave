@@ -42,4 +42,4 @@
              funcool/promesa {:mvn/version "11.0.678"}
              org.clojure/core.async {:mvn/version "1.9.865"}
              org.clojure/data.json {:mvn/version "2.5.2"}
-             nrepl/nrepl {:mvn/version "1.7.0"}}}}}
+             nrepl/nrepl {:mvn/version "1.8.0"}}}}}
