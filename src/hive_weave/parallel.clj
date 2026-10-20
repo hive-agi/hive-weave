@@ -89,7 +89,7 @@
                           coll)
               batches (long (Math/ceil (/ (count coll) (double concurrency))))
               deadline (+ (System/currentTimeMillis) (* timeout-ms batches))]
-          (mapv (fn [task]
+          (mapv (fn [^java.util.concurrent.Future task]
                   (let [remaining (max 1 (- deadline (System/currentTimeMillis)))]
                     (try
                       (.get task remaining TimeUnit/MILLISECONDS)
@@ -102,6 +102,34 @@
                 tasks))
         (finally
           (.shutdownNow pool))))))
+
+(defn missing-indices
+  "Indices of `results` that hold `sentinel`: the items a bounded-pmap run
+   could not answer (timed out or threw). Pure."
+  [sentinel results]
+  (into [] (keep-indexed (fn [i v] (when (identical? sentinel v) i))) results))
+
+(defn bounded-pmap-strict
+  "Like `bounded-pmap`, but an item that times out or throws is an ERROR, not
+   a fallback value. Throws ex-info {:type :hive-weave/pmap-incomplete
+   :missing [index ...] :count n} when any item is missing; otherwise returns
+   the full result vector.
+
+   Use it for partition-and-combine work, where a substituted nil is
+   indistinguishable from \"this chunk found nothing\" and a sum would come
+   back silently low. Accepts the same options as `bounded-pmap` except
+   :fallback, which it owns."
+  [opts f coll]
+  (let [sentinel (Object.)
+        results  (bounded-pmap (assoc opts :fallback sentinel) f coll)
+        missing  (missing-indices sentinel results)]
+    (if (seq missing)
+      (throw (ex-info (str "bounded-pmap-strict: " (count missing) " of "
+                           (count results) " items timed out or failed")
+                      {:type    :hive-weave/pmap-incomplete
+                       :missing missing
+                       :count   (count results)}))
+      results)))
 
 ;; =============================================================================
 ;; Fork-Join
