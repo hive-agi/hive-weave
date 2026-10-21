@@ -191,3 +191,77 @@
    Always returns (ok ...) — individual failures become nil/fallback."
   [opts f coll]
   (r/ok (bounded-pmap opts f coll)))
+
+(defn map-within
+  "Apply `f` to every item of `coll` on `:pool`, all under ONE deadline.
+   Returns a vector of Results, one per item, in input order:
+
+     (ok value)                      the item finished inside the deadline
+     (err :weave/timeout   {...})    the deadline passed first; the task is cancelled
+     (err :weave/exception {...})    `f` threw
+     (err :weave/rejected  {...})    a saturated :abort pool refused the item
+
+   Every error carries :index (position in `coll`) and :name.
+
+   Options:
+     :pool        ExecutorService to run on (required). It is NOT shut down: the
+                  caller owns it, which is what makes the concurrency bound a
+                  property of the pool rather than of one call.
+     :deadline-ms wall-clock budget for the WHOLE batch (required, pos-int)
+     :name        diagnostic label (default map-within)
+
+   The difference from `bounded-pmap`: its timeout is per item and the batch
+   bound is that figure times the number of waves, so a stalled backend costs a
+   caller `timeout x waves`. Here the budget is the one number the caller
+   states, however many items there are. Items still queued or running when it
+   passes are cancelled, so an expired batch does not keep the pool busy.
+
+   Items go through `hive-weave.pool/submit!`, so the caller's dynamic bindings
+   reach the pool threads. Pair this with a pool built with `:rejection :abort`:
+   a :caller-runs pool runs the overflow on the submitting thread, where the
+   deadline cannot interrupt it. Nothing is thrown for a failed item; the Result
+   carries it, so a caller can tell no-data from the-read-failed."
+  [{:keys [^ExecutorService pool deadline-ms name] :or {name "map-within"}} f coll]
+  {:pre [(some? pool) (pos-int? deadline-ms)]}
+  (let [deadline (+ (System/nanoTime) (* (long deadline-ms) 1000000))
+        wrap     (fn [item]
+                   (fn []
+                     (try
+                       (f item)
+                       (catch Throwable t {::exception t}))))
+        futures  (mapv (fn [item]
+                         (try
+                           (pool/submit! pool (wrap item))
+                           (catch RuntimeException e
+                             (if (pool/rejected? e) ::rejected (throw e)))))
+                       coll)
+        ctx      (fn [i] {:name name :index i})
+        timeout  (fn [i] (r/err :weave/timeout (assoc (ctx i) :timeout-ms deadline-ms)))]
+    (try
+      (into []
+            (map-indexed
+             (fn [i fut]
+               (if (= ::rejected fut)
+                 (r/err :weave/rejected (assoc (ctx i) :pool (pool/pool-stats pool)))
+                 (let [remaining-ns (max 0 (- deadline (System/nanoTime)))]
+                   (try
+                     (let [v (.get ^java.util.concurrent.Future fut remaining-ns TimeUnit/NANOSECONDS)]
+                       (if-let [ex (and (map? v) (::exception v))]
+                         (r/err :weave/exception
+                                (assoc (ctx i)
+                                       :message (.getMessage ^Throwable ex)
+                                       :class (str (class ex))))
+                         (r/ok v)))
+                     (catch TimeoutException _
+                       (.cancel ^java.util.concurrent.Future fut true)
+                       (log/debug "map-within:" name "item" i "hit the" deadline-ms "ms deadline")
+                       (timeout i))
+                     (catch java.util.concurrent.CancellationException _
+                       (timeout i))))))
+             futures))
+      (finally
+        ;; Reached early only if the collecting thread is interrupted: do not
+        ;; leave the rest of the batch holding pool threads.
+        (doseq [fut futures]
+          (when (instance? java.util.concurrent.Future fut)
+            (.cancel ^java.util.concurrent.Future fut true)))))))

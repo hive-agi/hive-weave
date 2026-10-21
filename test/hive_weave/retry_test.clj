@@ -28,6 +28,25 @@
       (is (= 1 @calls)   "thunk called exactly once")
       (is (= 0 @recovers) "recover! never invoked on success path"))))
 
+(deftest both-attempts-run-on-the-given-pool
+  (testing ":pool reaches safe-future-call for the first attempt and the retry"
+    (let [submitted (atom 0)
+          pool      (proxy [java.util.concurrent.AbstractExecutorService] []
+                      (execute [^Runnable task] (swap! submitted inc) (.run task))
+                      (shutdown [])
+                      (shutdownNow [] [])
+                      (isShutdown [] false)
+                      (isTerminated [] false)
+                      (awaitTermination [_ _] true))
+          calls     (atom 0)
+          result    (retry/with-recovery
+                      {:timeout-ms 1000 :name "pooled" :pool pool}
+                      #(if (= 1 (swap! calls inc))
+                         (throw (ex-info "transient" {}))
+                         :pooled))]
+      (is (= :pooled result))
+      (is (= 2 @submitted) "one pool task per attempt"))))
+
 ;; =============================================================================
 ;; Transient — fail once, recover, succeed on retry
 ;; =============================================================================
