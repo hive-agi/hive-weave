@@ -106,3 +106,80 @@
   (testing "wraps bounded-pmap in ok Result"
     (let [res (par/fan-out {:concurrency 2} inc [1 2 3])]
       (is (= [2 3 4] (:ok res))))))
+
+(deftest map-within-test
+  (let [p (pool/make-pool {:name "map-within-test" :size 4 :rejection :abort})]
+    (try
+      (testing "Results come back in input order, pool is left running"
+        (is (= (mapv inc (range 50))
+               (mapv :ok (par/map-within {:pool p :deadline-ms 20000} inc (range 50)))))
+        (is (not (.isShutdown p))))
+      (testing "empty coll"
+        (is (= [] (par/map-within {:pool p :deadline-ms 1000} inc []))))
+      (testing "a throwing item is an :weave/exception Result and spares its siblings"
+        (let [[a b c] (par/map-within {:pool p :deadline-ms 20000 :name "boom"}
+                                      #(if (= % 1) (throw (ex-info "no" {})) %)
+                                      (range 3))]
+          (is (= 0 (:ok a)))
+          (is (= :weave/exception (:error b)))
+          (is (= 1 (:index b)))
+          (is (= "no" (:message b)))
+          (is (= "boom" (:name b)))
+          (is (= 2 (:ok c)))))
+      (testing "concurrency never exceeds the pool"
+        (let [live (atom 0) peak (atom 0)]
+          (par/map-within {:pool p :deadline-ms 20000}
+                          (fn [_]
+                            (swap! peak max (swap! live inc))
+                            (Thread/sleep 15)
+                            (swap! live dec))
+                          (range 40))
+          (is (<= @peak 4))
+          (is (>= @peak 2))))
+      (testing "dynamic bindings reach the pool thread"
+        (is (= [7]
+               (mapv :ok (binding [*print-length* 7]
+                           (par/map-within {:pool p :deadline-ms 5000}
+                                           (fn [_] *print-length*) [1]))))))
+      (finally (pool/shutdown! p)))))
+
+(deftest map-within-one-deadline-test
+  (testing "the budget is for the batch: 8 slow items on 2 threads cost ~deadline, not deadline x waves"
+    (let [p (pool/make-pool {:name "map-within-deadline" :size 2 :rejection :abort})]
+      (try
+        (let [t0 (System/nanoTime)
+              rs (par/map-within {:pool p :deadline-ms 200}
+                                 (fn [_] (Thread/sleep 5000) :late)
+                                 (range 8))
+              ms (quot (- (System/nanoTime) t0) 1000000)]
+          (is (< ms 1000) (str "took " ms "ms"))
+          (is (= 8 (count rs)))
+          (is (every? #(= :weave/timeout (:error %)) rs))
+          (is (= (range 8) (map :index rs))))
+        (Thread/sleep 100)
+        (is (= [:fresh] (mapv :ok (par/map-within {:pool p :deadline-ms 2000}
+                                                  (fn [_] :fresh) [1])))
+            "an expired batch frees the pool: cancelled work does not keep threads")
+        (finally (pool/shutdown! p)))))
+  (testing "items done before the deadline keep their values"
+    (let [p (pool/make-pool {:name "map-within-partial" :size 2 :rejection :abort})]
+      (try
+        (let [rs (par/map-within {:pool p :deadline-ms 300}
+                                 (fn [i] (when (= i 1) (Thread/sleep 5000)) i)
+                                 [0 1])]
+          (is (= 0 (:ok (first rs))))
+          (is (= :weave/timeout (:error (second rs)))))
+        (finally (pool/shutdown! p))))))
+
+(deftest map-within-saturated-abort-pool-test
+  (testing "a saturated :abort pool yields :weave/rejected, never runs on the caller"
+    (let [p      (pool/make-pool {:name "map-within-sat" :size 1 :queue-capacity 1 :rejection :abort})
+          gate   (promise)
+          caller (Thread/currentThread)
+          rs     (try
+                   (par/map-within {:pool p :deadline-ms 300}
+                                   (fn [_] (deref gate 5000 nil) (Thread/currentThread))
+                                   (range 4))
+                   (finally (deliver gate :go) (pool/shutdown! p)))]
+      (is (some #(= :weave/rejected (:error %)) rs))
+      (is (not-any? #(= caller (:ok %)) rs)))))
