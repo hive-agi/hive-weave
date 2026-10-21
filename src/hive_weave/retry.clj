@@ -71,6 +71,14 @@
                    itself errored). Default throws ex-info; pass a
                    custom fn returning a Result/fallback to opt out
                    of throwing.
+     :pool       — ExecutorService both attempts run on, handed to
+                   `safe-future-call`. Omitted: `clojure.core/future`,
+                   whose pool is unbounded, so every call costs a
+                   thread and every timed-out call keeps one. Pass a
+                   bounded pool on hot paths. A saturated :abort pool
+                   yields (err :weave/rejected ...), which the default
+                   `:retry-on` treats as retryable; callers that shed
+                   load should exclude it.
 
    Examples:
 
@@ -95,14 +103,14 @@
         :name       \"probe\"
         :on-failure (fn [_ r] r)}
        (fn [] :ok))"
-  [{:keys [timeout-ms name recover! retry-on on-failure]
+  [{:keys [timeout-ms name recover! retry-on on-failure pool]
     :or   {name       "retry"
            retry-on   non-timeout-error?
            on-failure default-on-failure}}
    f]
   {:pre [(pos-int? timeout-ms)]}
   (let [first-r (safe/safe-future-call
-                  {:timeout-ms timeout-ms :name name}
+                  {:timeout-ms timeout-ms :name name :pool pool}
                   f)]
     (cond
       (r/ok? first-r)
@@ -117,7 +125,7 @@
                   {:operation name :error (:error first-r)})
         (when recover! (recover!))
         (let [retry-r (safe/safe-future-call
-                        {:timeout-ms timeout-ms :name (str name "/retry")}
+                        {:timeout-ms timeout-ms :name (str name "/retry") :pool pool}
                         f)]
           (if (r/ok? retry-r)
             (:ok retry-r)
