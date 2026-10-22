@@ -5,7 +5,9 @@
 
    Does NOT enforce admission policy — that's the broker's job. The sentinel
    is the signal; consumers decide what to do with it."
-  (:require [taoensso.timbre :as log])
+  (:require [hive-weave.heap.schema :as schema]
+            [malli.core :as m]
+            [taoensso.timbre :as log])
   (:import [java.util.concurrent Executors ScheduledExecutorService
                                  ThreadFactory TimeUnit]
            [java.util.concurrent.atomic AtomicLong]))
@@ -143,3 +145,20 @@
 (defn stop-sentinel! [^Sentinel s]
   (.shutdownNow ^ScheduledExecutorService (:executor s))
   s)
+
+;; --- Contracts ---
+
+(def SentinelSchema
+  "A running (or stopped) Sentinel record."
+  [:fn {:error/message "hive-weave.heap.Sentinel"} #(instance? Sentinel %)])
+
+(m/=> sample! [:=> [:cat] schema/HeapSample])
+(m/=> next-state [:=> [:cat schema/HeapState schema/Fraction schema/Watermarks]
+                  schema/HeapState])
+(m/=> snapshot [:=> [:cat SentinelSchema] schema/Snapshot])
+(m/=> register-observer! [:=> [:cat SentinelSchema schema/ObserverKey ifn?] SentinelSchema])
+(m/=> unregister-observer! [:=> [:cat SentinelSchema schema/ObserverKey] SentinelSchema])
+(m/=> start-sentinel! [:function
+                       [:=> [:cat] SentinelSchema]
+                       [:=> [:cat schema/SentinelOpts] SentinelSchema]])
+(m/=> stop-sentinel! [:=> [:cat SentinelSchema] SentinelSchema])

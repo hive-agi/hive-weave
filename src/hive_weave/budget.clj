@@ -2,7 +2,9 @@
   "Unit-agnostic budget gate. 1 permit = 1 unit; caller picks the unit
    (bytes/MiB/slots/etc). Saturation policy: block up to :timeout-ms,
    then (r/err :budget/timeout ...)."
-  (:require [hive-dsl.result :as r])
+  (:require [hive-dsl.result :as r]
+            [hive-weave.budget.schema :as schema]
+            [malli.core :as m])
   (:import [java.util.concurrent Semaphore TimeUnit]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
@@ -176,3 +178,39 @@
         submissions (mapv #(submit-workload gate %) workloads)
         deadline    (->deadline total-ms)]
     (into {} (map #(collect-submission % deadline)) submissions)))
+
+;; --- Contracts ---
+
+(def GateSchema
+  "Any IBudgetGate implementation."
+  [:fn {:error/message "IBudgetGate"} #(satisfies? IBudgetGate %)])
+
+(def ^:private SubmissionSchema
+  [:and [:fn {:error/message "Submission record"} #(instance? Submission %)]
+   schema/Submission])
+
+(def ^:private ForkJoinOpts
+  [:map
+   [:gate GateSchema]
+   [:total-ms {:optional true} nat-int?]])
+
+(m/=> byte-budget-gate [:=> [:cat schema/GateOpts] GateSchema])
+(m/=> byte-gate-stats [:=> [:cat GateSchema] schema/GateStats])
+(m/=> with-budget [:function
+                   [:=> [:cat GateSchema schema/Cost ifn?] schema/BudgetResult]
+                   [:=> [:cat GateSchema schema/Cost schema/TimeoutMs ifn?] schema/BudgetResult]])
+(m/=> with-byte-budget [:=> [:cat GateSchema schema/Cost ifn?] schema/BudgetResult])
+(m/=> ->workload [:=> [:cat schema/Task] schema/Workload])
+(m/=> ->deadline [:=> [:cat :int] schema/Deadline])
+(m/=> remaining-ms [:=> [:cat schema/Deadline] nat-int?])
+(m/=> resolve-outcome [:=> [:cat schema/OutcomeSource :any] schema/Outcome])
+(m/=> submit-workload [:=> [:cat GateSchema schema/Workload] SubmissionSchema])
+(m/=> await-outcome [:=> [:cat SubmissionSchema schema/Deadline] :any])
+(m/=> cancel-if-timed-out [:=> [:cat SubmissionSchema :any] :any])
+(m/=> collect-submission [:=> [:cat SubmissionSchema schema/Deadline] schema/Outcome])
+(m/=> byte-fork-join [:=> [:cat ForkJoinOpts [:* schema/Task]] [:map-of :any :any]])
+
+;; Protocol methods (registered for discovery/instrumentation; impls above).
+(m/=> -acquire [:=> [:cat GateSchema [:maybe schema/Cost] schema/TimeoutMs] schema/AcquireResult])
+(m/=> -release [:=> [:cat GateSchema [:maybe schema/Cost]] :nil])
+(m/=> -stats [:=> [:cat GateSchema] schema/GateStats])

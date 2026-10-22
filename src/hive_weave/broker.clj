@@ -8,8 +8,10 @@
      :high     → extend timeout (heap pressure: give GC headroom)
      :critical → reject-fast with :retry-after-ms (don't compound pressure)"
   (:require [hive-dsl.result :as r]
+            [hive-weave.broker.schema :as schema]
             [hive-weave.budget :as budget]
-            [hive-weave.heap :as heap]))
+            [hive-weave.heap :as heap]
+            [malli.core :as m]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -85,3 +87,18 @@
 (defn stop-broker! [b]
   (heap/stop-sentinel! (:sentinel b))
   b)
+
+;; --- Contracts ---
+
+(def BrokerSchema
+  "Any IResourceBroker implementation."
+  [:fn {:error/message "IResourceBroker"} #(satisfies? IResourceBroker %)])
+
+(m/=> decide-policy [:=> [:cat schema/HeapState :int [:maybe schema/PolicyOpts]]
+                     schema/Decision])
+(m/=> submit [:=> [:cat BrokerSchema schema/BrokerWorkload] schema/SubmitResult])
+(m/=> broker-stats [:=> [:cat BrokerSchema] schema/BrokerStats])
+(m/=> start-broker! [:function
+                     [:=> [:cat] BrokerSchema]
+                     [:=> [:cat schema/BrokerOpts] BrokerSchema]])
+(m/=> stop-broker! [:=> [:cat BrokerSchema] BrokerSchema])
