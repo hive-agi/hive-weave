@@ -13,8 +13,7 @@
   (:require [hive-dsl.result :as r]
             [taoensso.timbre :as log]
             [hive-weave.pool :as pool])
-  (:import
-[java.util.concurrent.atomic AtomicBoolean]))
+  (:import))
 
 ;; =============================================================================
 ;; Safe Deref
@@ -56,10 +55,10 @@
   "A fresh, un-cancelled token: [token cancel!]. `token` is an IDeref that
    answers nil until `(cancel!)` runs, true after."
   []
-  (let [flag (AtomicBoolean. false)]
+  (let [flag (atom false)]
     [(reify clojure.lang.IDeref
-       (deref [_] (when (.get flag) true)))
-     (fn [] (.set flag true))]))
+       (deref [_] (when @flag true)))
+     (fn [] (reset! flag true))]))
 
 (defn cancelled?
   "True when the current safe-future-call task was abandoned by its caller,
