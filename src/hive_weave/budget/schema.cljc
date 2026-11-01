@@ -113,7 +113,7 @@
   "A Workload in flight on a future."
   [:map
    [:workload Workload]
-   [:future [:fn {:error/message "future"} future?]]])
+   [:future [:fn {:error/message "future"} #?(:clj future? :cljs some?)]]])
 
 (def Deadline
   "Absolute epoch-millis deadline."
