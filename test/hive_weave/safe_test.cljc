@@ -108,19 +108,21 @@
 #?(:clj
    (deftest deref-safe-times-out-to-the-fallback
      (is (= ::fallback (safe/deref-safe (promise) 20 ::fallback)))
-     (is (= 42 (safe/deref-safe (delay 42) 1000 ::fallback)))))
+     ;; a DELIVERED promise is the JVM's synchronously-ready ref; a Delay is
+     ;; not IBlockingDeref, so a timed deref of one throws ClassCastException.
+     (is (= 42 (safe/deref-safe (doto (promise) (deliver 42)) 1000 ::fallback)))))
 
 #?(:clj
    (deftest deref-safe!-throws-on-timeout
      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"timed out"
                            (safe/deref-safe! (promise) 20)))
-     (is (= 42 (safe/deref-safe! (delay 42) 1000)))))
+     (is (= 42 (safe/deref-safe! (doto (promise) (deliver 42)) 1000)))))
 
 #?(:clj
    (deftest deref-cancelling-flips-the-token-on-timeout
      (let [cancelled (atom 0)
            fut       (future (Thread/sleep 10000) :late)]
-       (is (= ::timed-out (safe/deref-cancelling fut 20 #(swap! cancelled inc))))
+       (is (= :hive-weave.safe/timed-out (safe/deref-cancelling fut 20 #(swap! cancelled inc))))
        (is (= 1 @cancelled) "cancel! ran once for the abandoned deref")
        (is (true? (future-cancelled? fut))))))
 
