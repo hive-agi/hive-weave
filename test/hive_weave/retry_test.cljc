@@ -4,8 +4,14 @@
    Pins the retry contract: bounded per-attempt timeout, optional
    recover! between attempts, single retry, timeouts skip retry,
    default `:on-failure` throws but is overridable for opt-in
-   Result-returning callers."
-  (:require [clojure.test :refer [deftest is testing]]
+   Result-returning callers.
+
+   Cross-platform: the ladder (throw -> :weave/exception -> retry once)
+   is the same on node, so most of the suite runs on both hosts. The
+   timeout branch and the :pool branch are JVM-only — node has neither a
+   blocking timed deref nor an executor."
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])
             [hive-dsl.result :as r]
             [hive-weave.retry :as retry]))
 
@@ -27,25 +33,6 @@
       (is (= :ok result))
       (is (= 1 @calls)   "thunk called exactly once")
       (is (= 0 @recovers) "recover! never invoked on success path"))))
-
-(deftest both-attempts-run-on-the-given-pool
-  (testing ":pool reaches safe-future-call for the first attempt and the retry"
-    (let [submitted (atom 0)
-          pool      (proxy [java.util.concurrent.AbstractExecutorService] []
-                      (execute [^Runnable task] (swap! submitted inc) (.run task))
-                      (shutdown [])
-                      (shutdownNow [] [])
-                      (isShutdown [] false)
-                      (isTerminated [] false)
-                      (awaitTermination [_ _] true))
-          calls     (atom 0)
-          result    (retry/with-recovery
-                      {:timeout-ms 1000 :name "pooled" :pool pool}
-                      #(if (= 1 (swap! calls inc))
-                         (throw (ex-info "transient" {}))
-                         :pooled))]
-      (is (= :pooled result))
-      (is (= 2 @submitted) "one pool task per attempt"))))
 
 ;; =============================================================================
 ;; Transient — fail once, recover, succeed on retry
@@ -72,32 +59,6 @@
       (is (= 1 @recovers) "recover! called exactly once between attempts"))))
 
 ;; =============================================================================
-;; Timeout — retry is skipped (alive but slow)
-;; =============================================================================
-
-(deftest timeout-skips-retry
-  (testing "first-attempt timeout surfaces immediately — recover! not called,
-            no retry. Default on-failure throws ex-info carrying the
-            :weave/timeout Result."
-    (let [calls    (atom 0)
-          recovers (atom 0)]
-      (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo #"with-recovery failed: slow"
-            (retry/with-recovery
-              {:timeout-ms 50
-               :name       "slow"
-               :recover!   (fn [] (swap! recovers inc))}
-              (fn []
-                (swap! calls inc)
-                (Thread/sleep 500)
-                :never))))
-      (is (= 0 @recovers) "recover! NOT called on timeout (would just re-time-out)")
-      ;; calls may be 0 or 1 depending on whether the inner future
-      ;; managed to enter the body before the deref-timeout fired.
-      ;; The contract is that at most ONE attempt happened.
-      (is (<= @calls 1) "no retry attempt was made"))))
-
-;; =============================================================================
 ;; Terminal — both attempts fail, on-failure invoked with retry's Result
 ;; =============================================================================
 
@@ -107,7 +68,8 @@
     (let [calls    (atom 0)
           recovers (atom 0)]
       (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo #"with-recovery failed: doomed"
+            #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+            #"with-recovery failed: doomed"
             (retry/with-recovery
               {:timeout-ms 1000
                :name       "doomed"
@@ -164,10 +126,81 @@
 ;; =============================================================================
 
 (deftest timeout-ms-must-be-pos-int
-  (testing "missing :timeout-ms triggers AssertionError via :pre"
-    (is (thrown? AssertionError
-          (retry/with-recovery {} (fn [] :ok))))
-    (is (thrown? AssertionError
-          (retry/with-recovery {:timeout-ms 0} (fn [] :ok))))
-    (is (thrown? AssertionError
-          (retry/with-recovery {:timeout-ms -1} (fn [] :ok))))))
+  (testing "missing :timeout-ms triggers the :pre assertion"
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (retry/with-recovery {} (fn [] :ok))))
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (retry/with-recovery {:timeout-ms 0} (fn [] :ok))))
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (retry/with-recovery {:timeout-ms -1} (fn [] :ok))))))
+
+;; =============================================================================
+;; JVM — timeout skips retry, :pool reaches both attempts
+;; =============================================================================
+
+#?(:clj
+   (deftest both-attempts-run-on-the-given-pool
+     (testing ":pool reaches safe-future-call for the first attempt and the retry"
+       (let [submitted (atom 0)
+             pool      (proxy [java.util.concurrent.AbstractExecutorService] []
+                         (execute [^Runnable task] (swap! submitted inc) (.run task))
+                         (shutdown [])
+                         (shutdownNow [] [])
+                         (isShutdown [] false)
+                         (isTerminated [] false)
+                         (awaitTermination [_ _] true))
+             calls     (atom 0)
+             result    (retry/with-recovery
+                         {:timeout-ms 1000 :name "pooled" :pool pool}
+                         #(if (= 1 (swap! calls inc))
+                            (throw (ex-info "transient" {}))
+                            :pooled))]
+         (is (= :pooled result))
+         (is (= 2 @submitted) "one pool task per attempt")))))
+
+#?(:clj
+   (deftest timeout-skips-retry
+     (testing "first-attempt timeout surfaces immediately — recover! not called,
+               no retry. Default on-failure throws ex-info carrying the
+               :weave/timeout Result."
+       (let [calls    (atom 0)
+             recovers (atom 0)]
+         (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"with-recovery failed: slow"
+               (retry/with-recovery
+                 {:timeout-ms 50
+                  :name       "slow"
+                  :recover!   (fn [] (swap! recovers inc))}
+                 (fn []
+                   (swap! calls inc)
+                   (Thread/sleep 500)
+                   :never))))
+         (is (= 0 @recovers) "recover! NOT called on timeout (would just re-time-out)")
+         ;; calls may be 0 or 1 depending on whether the inner future
+         ;; managed to enter the body before the deref-timeout fired.
+         ;; The contract is that at most ONE attempt happened.
+         (is (<= @calls 1) "no retry attempt was made")))))
+
+;; =============================================================================
+;; ClojureScript — a timeout cannot occur; a throw is what retries
+;; =============================================================================
+
+#?(:cljs
+   (deftest timeout-is-advisory-so-a-throw-is-the-retryable-outcome
+     (testing "node cannot time out a synchronous thunk: the retry ladder is
+               driven by :weave/exception, which the default :retry-on accepts"
+       (let [calls    (atom 0)
+             recovers (atom 0)
+             result   (retry/with-recovery
+                        {:timeout-ms 1
+                         :name       "sync"
+                         :recover!   (fn [] (swap! recovers inc))
+                         :on-failure (fn [_label r] r)}
+                        (fn []
+                          (swap! calls inc)
+                          (dotimes [_ 100000] nil)
+                          (throw (ex-info "always" {}))))]
+         (is (r/err? result))
+         (is (= :weave/exception (:error result)))
+         (is (= 2 @calls)    "slow synchronous work still gets its one retry")
+         (is (= 1 @recovers) "recover! ran between the attempts")))))
