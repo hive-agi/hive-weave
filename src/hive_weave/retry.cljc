@@ -25,10 +25,17 @@
    - **Single-retry by design**: needs more attempts? Compose with
      `hive-weave.parallel` or add an explicit `:max-attempts` knob
      when a real caller demands it. Don't make this fn a swiss-army
-     knife."
+     knife.
+
+   ClojureScript: the retry ladder is identical — a thrown thunk maps to
+   `:weave/exception`, which the default `:retry-on` accepts, so
+   `recover!` runs once and the thunk is retried. What changes is that
+   `:timeout-ms` is advisory there (see `hive-weave.safe`), so no attempt
+   ever answers `:weave/timeout` and the timeout branch is unreachable.
+   Logging is JVM-only: timbre is not a cljs dependency of this library."
   (:require [hive-dsl.result :as r]
             [hive-weave.safe :as safe]
-            [taoensso.timbre :as log]))
+            #?@(:clj [[taoensso.timbre :as log]])))
 
 (defn- non-timeout-error?
   "Default `:retry-on` predicate — every Result error EXCEPT
@@ -78,7 +85,7 @@
                    bounded pool on hot paths. A saturated :abort pool
                    yields (err :weave/rejected ...), which the default
                    `:retry-on` treats as retryable; callers that shed
-                   load should exclude it.
+                   load should exclude it. JVM only.
 
    Examples:
 
@@ -121,8 +128,8 @@
 
       :else
       (do
-        (log/warn "with-recovery: first attempt failed, recovering and retrying once"
-                  {:operation name :error (:error first-r)})
+        #?(:clj (log/warn "with-recovery: first attempt failed, recovering and retrying once"
+                          {:operation name :error (:error first-r)}))
         (when recover! (recover!))
         (let [retry-r (safe/safe-future-call
                         {:timeout-ms timeout-ms :name (str name "/retry") :pool pool}
