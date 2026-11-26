@@ -7,7 +7,7 @@
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
-;; SPDX-License-Identifier: AGPL-3.0-or-later
+;; SPDX-License-Identifier: MIT
 
 (def PolicyOpts
   "Policy table knobs. Keys are optional (defaults apply) but never nil."

@@ -6,7 +6,7 @@
   (:require [typed.clojure :as t]
             [hive-weave.async]))
 
-;; SPDX-License-Identifier: LicenseRef-Proprietary
+;; SPDX-License-Identifier: MIT
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 
 (t/defalias Label t/Str)
