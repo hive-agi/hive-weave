@@ -6,7 +6,12 @@
 
    - `wrap-timed`            — wrap any (fn [x] -> x) with timeout
    - `->timed-interceptor`   — interceptor with timeout on :before/:after
-   - `timed-handler`         — handler with timeout + fallback"
+   - `timed-handler`         — handler with timeout + fallback
+
+   ClojureScript note: the JVM impls run f on a `future` and bound it with a
+   timed `deref`, cancelling on timeout. Node is single-threaded, so synchronous
+   work can not be interrupted — the :cljs branches run f to completion and treat
+   the timeout as advisory (no `future-cancel`, no passthrough/fallback path)."
   (:require [taoensso.timbre :as log]))
 
 ;; =============================================================================
@@ -24,17 +29,24 @@
      :timeout-ms — max execution time (required)
      :name       — diagnostic label (optional)
 
-   (def safe-enrich (wrap-timed enrich-fn {:timeout-ms 15000 :name \"enrichment\"}))"
+   (def safe-enrich (wrap-timed enrich-fn {:timeout-ms 15000 :name \"enrichment\"}))
+
+   ClojureScript: runs f synchronously and returns its result; the timeout is
+   advisory (synchronous node work cannot be interrupted)."
   [f {:keys [timeout-ms name] :or {name "anonymous"}}]
   {:pre [(pos-int? timeout-ms)]}
   (fn [input]
-    (let [fut (future (f input))
-          result (deref fut timeout-ms ::timed-out)]
-      (if (= result ::timed-out)
-        (do (log/warn "wrap-timed" name "exceeded" timeout-ms "ms — passing through")
-            (future-cancel fut)
-            input)
-        result))))
+    #?(:clj
+       (let [fut (future (f input))
+             result (deref fut timeout-ms ::timed-out)]
+         (if (= result ::timed-out)
+           (do (log/warn "wrap-timed" name "exceeded" timeout-ms "ms — passing through")
+               (future-cancel fut)
+               input)
+           result))
+       :cljs
+       ;; single-threaded node: run f synchronously; timeout is advisory
+       (f input))))
 
 ;; =============================================================================
 ;; Timed Interceptor
@@ -78,14 +90,20 @@
 
    (def safe-search
      (timed-handler search-fn {:timeout-ms 10000 :fallback {:error \"timeout\"}}))
-   (safe-search params)  ;; => result or {:error \"timeout\"}"
+   (safe-search params)  ;; => result or {:error \"timeout\"}
+
+   ClojureScript: runs f synchronously and returns its result; the timeout is
+   advisory, so the fallback is never reached for synchronous work."
   [f {:keys [timeout-ms fallback name] :or {name "handler"}}]
   {:pre [(pos-int? timeout-ms)]}
   (fn [& args]
-    (let [fut (future (apply f args))
-          result (deref fut timeout-ms ::timed-out)]
-      (if (= result ::timed-out)
-        (do (log/warn "timed-handler" name "exceeded" timeout-ms "ms — returning fallback")
-            (future-cancel fut)
-            fallback)
-        result))))
+    #?(:clj
+       (let [fut (future (apply f args))
+             result (deref fut timeout-ms ::timed-out)]
+         (if (= result ::timed-out)
+           (do (log/warn "timed-handler" name "exceeded" timeout-ms "ms — returning fallback")
+               (future-cancel fut)
+               fallback)
+           result))
+       :cljs
+       (apply f args))))
