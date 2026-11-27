@@ -18,7 +18,7 @@
             [hive-weave.pool :as pool]
             [malli.core :as m]))
 
-;; SPDX-License-Identifier: LicenseRef-Proprietary
+;; SPDX-License-Identifier: MIT
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 
 ;; =============================================================================

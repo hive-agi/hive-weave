@@ -2,7 +2,7 @@
   "Malli value objects for hive-weave.async. Drives the m/=> contracts on the
    pure constructors and the synthesized tests.")
 
-;; SPDX-License-Identifier: LicenseRef-Proprietary
+;; SPDX-License-Identifier: MIT
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 
 (def Label
